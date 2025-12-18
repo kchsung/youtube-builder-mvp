@@ -1,0 +1,34 @@
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Node / Vite build outputs
+**/node_modules/
+**/dist/
+**/.vite/
+**/coverage/
+
+# Env files (do not commit secrets)
+**/.env
+**/.env.*
+!**/.env.example
+
+# This repo's local env files
+apps/web/env.local
+
+# Supabase local config (if present)
+supabase/.temp/
+supabase/.branches/
+supabase/.env
+supabase/.env.*
+
+

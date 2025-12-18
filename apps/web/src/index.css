@@ -1,0 +1,40 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-zinc-950 text-zinc-100 antialiased font-sans;
+  background-image: radial-gradient(1200px 600px at 20% -10%, rgba(99, 102, 241, 0.22), transparent 60%),
+    radial-gradient(900px 500px at 90% 0%, rgba(56, 189, 248, 0.14), transparent 60%),
+    radial-gradient(700px 420px at 60% 110%, rgba(236, 72, 153, 0.10), transparent 60%);
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold transition disabled:opacity-50 disabled:pointer-events-none;
+  }
+  .btn-primary {
+    @apply btn bg-white text-zinc-950 hover:bg-zinc-100;
+  }
+  .btn-ghost {
+    @apply btn border border-white/10 bg-white/5 hover:bg-white/10;
+  }
+  .btn-dark {
+    @apply btn border border-white/10 bg-zinc-950 hover:bg-zinc-900;
+  }
+  .btn-danger {
+    @apply btn border border-red-500/30 bg-red-500/10 text-red-200 hover:bg-red-500/20;
+  }
+  .card {
+    @apply rounded-2xl border border-white/10 bg-white/5 backdrop-blur;
+  }
+  .codebox {
+    @apply rounded-xl border border-white/10 bg-zinc-950 p-3 text-xs text-zinc-200;
+  }
+}
