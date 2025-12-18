@@ -15,7 +15,7 @@ export function HomePage() {
   const nav = useNavigate()
   const [topicDomain, setTopicDomain] = useState('')
   const [language, setLanguage] = useState('ko')
-  const [audience, setAudience] = useState('중학생')
+  const [audience, setAudience] = useState('')
   const [inputAsText, setInputAsText] = useState('')
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -104,17 +104,22 @@ export function HomePage() {
             </label>
             <label className="grid gap-1">
               <span className="text-xs font-medium text-zinc-300">language</span>
-              <input
+              <select
                 className="h-10 rounded-lg border border-white/10 bg-zinc-950 px-3 text-sm outline-none focus:border-white/20"
                 value={language}
                 onChange={(e) => setLanguage(e.target.value)}
-              />
+              >
+                <option value="ko">한국어</option>
+                <option value="en">영어</option>
+                <option value="ja">일본어</option>
+              </select>
             </label>
             <label className="grid gap-1">
               <span className="text-xs font-medium text-zinc-300">audience</span>
               <input
                 className="h-10 rounded-lg border border-white/10 bg-zinc-950 px-3 text-sm outline-none focus:border-white/20"
                 value={audience}
+                placeholder="예: 중학생, 대학생, 전문가, 어린이, 시니어"
                 onChange={(e) => setAudience(e.target.value)}
               />
             </label>
