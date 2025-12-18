@@ -487,12 +487,17 @@ async function runPipeline(jobId: string, traceId: string, payload: TrendStorySt
     await supabase.from('ytg_jobs').update({ status: 'RUNNING' satisfies JobStatus, error: null }).eq('id', jobId)
 
     // ---- 0) AutoConfig Agent ----
+    const extraPrompt = payload.input_as_text?.trim() ? payload.input_as_text.trim() : null
+
     const autoconfigInstructions = `너는 AutoConfig Agent다.
-입력은 {{ 단 하나다.
+입력은 JSON 1개이며 다음 키를 포함한다:
+- topic_domain (string, required)
+- language (string, required)
+- audience (string, required)
 
 목표:
 - TrendStory Packager Agent가 바로 사용할 수 있도록, 아래 config JSON을 생성한다.
-- 사용자가 추가 입력을 하지 않아도 되는 “기본값”을 합리적으로 채운다.
+- 사용자 입력(topic_domain/language/audience)을 반드시 반영한다.
 - scene_count는 6~12 사이에서 topic_domain에 맞게 선택한다.
 - scene_seeds는 scene_count 개수만큼 만들고, topic_domain과 자연스럽게 연결된 사건/학습 포인트가 들어가야 한다.
 - 위험/혐오/성적/폭력 과도 요소는 배제하고 아동·청소년 안전을 우선한다.
@@ -501,7 +506,7 @@ async function runPipeline(jobId: string, traceId: string, payload: TrendStorySt
 language, audience, tone, duration_min, platform_target, visual_style,
 main_character_hint, safety_level, scene_count, scene_seeds
 
-기본값 규칙(사용자 입력이 없으므로 항상 적용):
+기본값 규칙(입력이 비어있거나 누락된 경우에만 적용):
 - language: "ko"
 - audience: "중학생"
 - tone: "모험"
@@ -511,13 +516,22 @@ main_character_hint, safety_level, scene_count, scene_seeds
 - main_character_hint: "친근한 한국 학생 1~2명"
 - safety_level: "strict"
 
+추가 규칙:
+- 아래 “추가 지시사항”이 있으면, visual_style / tone / main_character_hint / scene_seeds에 자연스럽게 반영하되, topic_domain과 무관한 이야기로 바꾸지 말 것.
+- language가 "en"이면 scene_seeds/scene_title/seed는 영어로 작성한다.
+
+추가 지시사항:
+${extraPrompt ?? '(없음)'}
+
 출력 형식:
 - 오직 JSON만 출력한다. (설명/마크다운/코드펜스 금지)
 - scene_seeds는 배열이며, 각 원소는 {scene_title, seed}를 포함한다.`
 
-    const autoconfigInput = payload.input_as_text?.trim()
-      ? payload.input_as_text.trim()
-      : `topic_domain: ${payload.topic_domain}\nlanguage: ${payload.language}\naudience: ${payload.audience}`
+    const autoconfigInput = JSON.stringify({
+      topic_domain: payload.topic_domain,
+      language: payload.language,
+      audience: payload.audience,
+    })
 
     const autoconfig = await openaiResponsesJson<AutoConfigOutput>({
       model: 'gpt-5.2',
@@ -566,8 +580,10 @@ main_character_hint, safety_level, scene_count, scene_seeds
 
     const packagerInputObj = {
       topic_domain: payload.topic_domain,
-      language: autoconfig.language ?? payload.language,
-      audience: autoconfig.audience ?? payload.audience,
+      // payload에서 이미 필수 검증을 했으므로, 사용자가 넣은 값을 우선합니다.
+      // (autoconfig가 기본값 ko/중학생으로 튀어도 packager를 덮어쓰지 않도록)
+      language: payload.language,
+      audience: payload.audience,
       scene_count: autoconfig.scene_count ?? 6,
       scene_seeds: autoconfig.scene_seeds ?? [],
       tone: autoconfig.tone,
@@ -640,8 +656,49 @@ main_character_hint, safety_level, scene_count, scene_seeds
     )
     if (insScenes.error) throw new Error(insScenes.error.message)
 
-    // 2) per-scene image generation + upload + update rows
     const assetRows: Array<Omit<DbAssetRow, 'id'>> = []
+
+    // 2) TTS (single track) - 오디오를 먼저 생성한다.
+    const narrationText =
+      String(packager?.tts?.full_script ?? '').trim() ||
+      scenes
+        .map((s) => s.narration?.trim())
+        .filter(Boolean)
+        .map((t, i) => `${i + 1}. ${t}`)
+        .join('\n')
+
+    let audioUrl: string | null = null
+    if (narrationText.trim().length > 0) {
+      try {
+        pushRuntimeLog(packager, 'info', 'TTS 생성 시작', { chars: narrationText.length })
+        const mp3 = await openaiTtsMp3(narrationText)
+        const audioPath = `jobs/${jobId}/narration.mp3`
+        const upA = await supabase.storage.from(bucket).upload(audioPath, new Blob([toArrayBuffer(mp3)], { type: 'audio/mpeg' }), {
+          contentType: 'audio/mpeg',
+          upsert: true,
+        })
+        if (upA.error) throw new Error(upA.error.message)
+        audioUrl = supabase.storage.from(bucket).getPublicUrl(audioPath).data.publicUrl
+        assetRows.push({
+          job_id: jobId,
+          type: 'audio',
+          path: audioPath,
+          url: audioUrl,
+          meta: { provider: 'openai', model: 'gpt-4o-mini-tts', voice: 'alloy' },
+        })
+        pushRuntimeLog(packager, 'info', 'TTS 생성 완료', { audio_url: audioUrl })
+      } catch (e: any) {
+        const msg = e?.message ?? String(e)
+        pushRuntimeLog(packager, 'error', 'TTS 생성 실패 - 오디오 없이 계속 진행합니다.', { error: msg })
+        audioUrl = null
+      }
+    } else {
+      pushRuntimeLog(packager, 'error', 'TTS 스크립트가 비어 있어 오디오 생성을 건너뜁니다.', {
+        hint: 'packager.tts.full_script 또는 scenes[n].narration이 비어있습니다.',
+      })
+    }
+
+    // 3) per-scene image generation + upload + update rows (오디오 이후)
     const validSceneIds = new Set(scenes.map((s) => s.scene_id))
     const norm = normalizeImageRenderRequests(packager, scenes.map((s) => s.scene_id), (packager.style_guide as any)?.platform_target ?? null)
     if (norm.generated) {
@@ -654,60 +711,58 @@ main_character_hint, safety_level, scene_count, scene_seeds
     }
 
     ensureRuntime(packager).image_render_requests_count = norm.requests.length
-    if (norm.requests.length === 0) {
-      pushRuntimeLog(packager, 'error', 'image_render_requests가 0개라 이미지 생성 호출을 할 수 없습니다.', {
-        hint: 'packager가 image_render_requests/image_prompts를 비웠거나 scenes/scene_id 매핑이 깨졌습니다.',
-      })
-      await supabase.from('ytg_jobs').update({ packager }).eq('id', jobId)
-      throw new Error('image_render_requests is empty; cannot generate images')
-    }
-
     let imagesSuccess = 0
     let imagesFailed = 0
     let imagesSkipped = 0
     const imagesErrors: Array<{ scene_id?: number; error: string }> = []
 
-    for (const r of norm.requests) {
-      const sceneId = Number((r as any)?.scene_id)
-      const prompt = String((r as any)?.prompt ?? '').trim()
-      if (!Number.isFinite(sceneId) || !validSceneIds.has(sceneId) || !prompt) {
-        imagesSkipped++
-        continue
-      }
+    if (norm.requests.length === 0) {
+      pushRuntimeLog(packager, 'error', 'image_render_requests가 0개라 이미지 생성을 건너뜁니다.', {
+        hint: 'packager가 image_render_requests/image_prompts를 비웠거나 scenes/scene_id 매핑이 깨졌습니다.',
+      })
+      imagesSkipped = scenes.length
+    } else {
+      for (const r of norm.requests) {
+        const sceneId = Number((r as any)?.scene_id)
+        const prompt = String((r as any)?.prompt ?? '').trim()
+        if (!Number.isFinite(sceneId) || !validSceneIds.has(sceneId) || !prompt) {
+          imagesSkipped++
+          continue
+        }
 
-      try {
-        pushRuntimeLog(packager, 'info', '이미지 생성 시작', { scene_id: sceneId })
-        const png = await openaiImagePng(prompt)
-        const path = `jobs/${jobId}/scene-${String(sceneId).padStart(2, '0')}-${safeFilename(payload.topic_domain).slice(0, 48)}.png`
-        const up = await supabase.storage.from(bucket).upload(path, new Blob([toArrayBuffer(png)], { type: 'image/png' }), {
-          contentType: 'image/png',
-          upsert: true,
-        })
-        if (up.error) throw new Error(up.error.message)
-        const publicUrl = supabase.storage.from(bucket).getPublicUrl(path).data.publicUrl
+        try {
+          pushRuntimeLog(packager, 'info', '이미지 생성 시작', { scene_id: sceneId })
+          const png = await openaiImagePng(prompt)
+          const path = `jobs/${jobId}/scene-${String(sceneId).padStart(2, '0')}-${safeFilename(payload.topic_domain).slice(0, 48)}.png`
+          const up = await supabase.storage.from(bucket).upload(path, new Blob([toArrayBuffer(png)], { type: 'image/png' }), {
+            contentType: 'image/png',
+            upsert: true,
+          })
+          if (up.error) throw new Error(up.error.message)
+          const publicUrl = supabase.storage.from(bucket).getPublicUrl(path).data.publicUrl
 
-        const upd = await supabase
-          .from('ytg_scenes')
-          .update({ image_path: path, image_url: publicUrl, image_prompt: prompt })
-          .eq('job_id', jobId)
-          .eq('scene_id', sceneId)
-        if (upd.error) throw new Error(upd.error.message)
+          const upd = await supabase
+            .from('ytg_scenes')
+            .update({ image_path: path, image_url: publicUrl, image_prompt: prompt })
+            .eq('job_id', jobId)
+            .eq('scene_id', sceneId)
+          if (upd.error) throw new Error(upd.error.message)
 
-        assetRows.push({
-          job_id: jobId,
-          type: 'image',
-          path,
-          url: publicUrl,
-          meta: { scene_id: sceneId, prompt, requested_size: (r as any)?.size ?? null },
-        })
-        imagesSuccess++
-        pushRuntimeLog(packager, 'info', '이미지 생성 완료', { scene_id: sceneId })
-      } catch (e: any) {
-        imagesFailed++
-        const msg = e?.message ?? String(e)
-        imagesErrors.push({ scene_id: sceneId, error: msg })
-        pushRuntimeLog(packager, 'error', '이미지 생성 실패', { scene_id: sceneId, error: msg })
-        // keep going for other scenes
+          assetRows.push({
+            job_id: jobId,
+            type: 'image',
+            path,
+            url: publicUrl,
+            meta: { scene_id: sceneId, prompt, requested_size: (r as any)?.size ?? null },
+          })
+          imagesSuccess++
+          pushRuntimeLog(packager, 'info', '이미지 생성 완료', { scene_id: sceneId })
+        } catch (e: any) {
+          imagesFailed++
+          const msg = e?.message ?? String(e)
+          imagesErrors.push({ scene_id: sceneId, error: msg })
+          pushRuntimeLog(packager, 'error', '이미지 생성 실패', { scene_id: sceneId, error: msg })
+        }
       }
     }
 
@@ -717,42 +772,6 @@ main_character_hint, safety_level, scene_count, scene_seeds
     rt.images_skipped = imagesSkipped
     rt.images_errors = imagesErrors
     await supabase.from('ytg_jobs').update({ packager }).eq('id', jobId)
-
-    if (imagesSuccess === 0) {
-      // 이미지가 전부 실패해도 오디오/TTS까지는 진행되도록 한다.
-      pushRuntimeLog(packager, 'warn', '이미지 생성 성공 0건 - 오디오 생성은 계속 진행합니다.', {
-        failed: imagesFailed,
-        skipped: imagesSkipped,
-      })
-    }
-
-    // 3) TTS (single track)
-    const narrationText =
-      String(packager?.tts?.full_script ?? '').trim() ||
-      scenes
-        .map((s) => s.narration?.trim())
-        .filter(Boolean)
-        .map((t, i) => `${i + 1}. ${t}`)
-        .join('\n')
-
-    let audioUrl: string | null = null
-    if (narrationText.trim().length > 0) {
-      pushRuntimeLog(packager, 'info', 'TTS 생성 시작', { chars: narrationText.length })
-      const mp3 = await openaiTtsMp3(narrationText)
-      const audioPath = `jobs/${jobId}/narration.mp3`
-      const upA = await supabase.storage.from(bucket).upload(audioPath, new Blob([toArrayBuffer(mp3)], { type: 'audio/mpeg' }), {
-        contentType: 'audio/mpeg',
-        upsert: true,
-      })
-      if (upA.error) throw new Error(upA.error.message)
-      audioUrl = supabase.storage.from(bucket).getPublicUrl(audioPath).data.publicUrl
-      assetRows.push({ job_id: jobId, type: 'audio', path: audioPath, url: audioUrl, meta: { provider: 'openai', model: 'gpt-4o-mini-tts', voice: 'alloy' } })
-      pushRuntimeLog(packager, 'info', 'TTS 생성 완료', { audio_url: audioUrl })
-    } else {
-      pushRuntimeLog(packager, 'error', 'TTS 스크립트가 비어 있어 오디오 생성을 건너뜁니다.', {
-        hint: 'packager.tts.full_script 또는 scenes[n].narration이 비어있습니다.',
-      })
-    }
 
     // 4) assets insert
     assetRows.push({

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { functionsGet, functionsPost } from '../lib/functionsClient'
+import { ApiError, functionsGet, functionsPost } from '../lib/functionsClient'
 import type {
   TrendStoryDeleteJobRequest,
   TrendStoryDeleteJobResponse,
@@ -73,7 +73,11 @@ export function HomePage() {
       const res = await functionsPost<TrendStoryStartResponse, any>('trendstory-start', payload as any)
       nav(`/jobs/${res.job_id}`)
     } catch (err: any) {
-      setError(err?.message ?? '요청 중 오류가 발생했습니다.')
+      if (err instanceof ApiError) {
+        setError(err.bodyText ? `${err.message}\n${err.bodyText}` : err.message)
+      } else {
+        setError(err?.message ?? '요청 중 오류가 발생했습니다.')
+      }
     } finally {
       setIsSubmitting(false)
     }
@@ -126,10 +130,10 @@ export function HomePage() {
           </div>
 
           <label className="mt-4 grid gap-1">
-            <span className="text-xs font-medium text-zinc-300">input_as_text (선택)</span>
+            <span className="text-xs font-medium text-zinc-300">추가 프롬프트 (선택)</span>
             <textarea
               className="min-h-24 rounded-lg border border-white/10 bg-zinc-950 p-3 text-sm outline-none focus:border-white/20"
-              placeholder="원하면 추가 컨텍스트를 자유롭게 적어주세요. (없어도 동작)"
+              placeholder="스타일/톤/금지사항/구성 힌트 등을 적어주세요. 예: “이미지는 만화 스케치톤으로, 텍스트/워터마크 없이”"
               value={inputAsText}
               onChange={(e) => setInputAsText(e.target.value)}
             />

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
-import { functionsGet, functionsPost } from '../lib/functionsClient'
+import { ApiError, functionsGet, functionsPost } from '../lib/functionsClient'
 import { copyText, downloadFileFromUrl, downloadJson, downloadScenesImagesZip } from '../lib/clientUtils'
 import type {
   TrendStoryRetryImagesRequest,
@@ -44,7 +44,12 @@ export function JobPage() {
       const res = await functionsGet<TrendStoryStatusResponse>(`trendstory-status?job_id=${encodeURIComponent(jobId)}`)
       setData(res)
     } catch (err: any) {
-      const msg = err?.message ?? '조회 중 오류가 발생했습니다.'
+      const msg =
+        err instanceof ApiError
+          ? err.bodyText
+            ? `${err.message}\n${err.bodyText}`
+            : err.message
+          : err?.message ?? '조회 중 오류가 발생했습니다.'
       setError(msg)
       if (typeof msg === 'string' && msg.startsWith('Missing required env:')) setPollingBlocked(true)
     } finally {
@@ -66,7 +71,13 @@ export function JobPage() {
       setRetryMsg(`이미지 재시도: 성공 ${res.succeeded} / 실패 ${res.failed} (시도 ${res.attempted})`)
       await refresh()
     } catch (err: any) {
-      setRetryMsg(`이미지 재시도 실패: ${err?.message ?? '알 수 없는 오류'}`)
+      const msg =
+        err instanceof ApiError
+          ? err.bodyText
+            ? `${err.message}\n${err.bodyText}`
+            : err.message
+          : err?.message ?? '알 수 없는 오류'
+      setRetryMsg(`이미지 재시도 실패: ${msg}`)
     } finally {
       setIsRetryingImages(false)
     }
@@ -98,7 +109,13 @@ export function JobPage() {
       // hard navigate to new job
       window.location.href = `/jobs/${res.job_id}`
     } catch (err: any) {
-      setRetryMsg(`전체 재생성 실패: ${err?.message ?? '알 수 없는 오류'}`)
+      const msg =
+        err instanceof ApiError
+          ? err.bodyText
+            ? `${err.message}\n${err.bodyText}`
+            : err.message
+          : err?.message ?? '알 수 없는 오류'
+      setRetryMsg(`전체 재생성 실패: ${msg}`)
     } finally {
       setIsRestarting(false)
     }
@@ -125,7 +142,13 @@ export function JobPage() {
         await refresh()
       } catch (err: any) {
         fail += 1
-        setRetryMsg(`전체 이미지 재생성 진행 중... (scene ${sid}) 오류: ${err?.message ?? '알 수 없는 오류'}`)
+        const msg =
+          err instanceof ApiError
+            ? err.bodyText
+              ? `${err.message}\n${err.bodyText}`
+              : err.message
+            : err?.message ?? '알 수 없는 오류'
+        setRetryMsg(`전체 이미지 재생성 진행 중... (scene ${sid}) 오류: ${msg}`)
       }
     }
     setRetryMsg(`전체 이미지 재생성 완료: 성공 ${ok} / 실패 ${fail}`)
@@ -143,7 +166,13 @@ export function JobPage() {
       setRetryMsg(res.message || '오디오 재생성을 시작했습니다. 잠시 후 새로고침 해주세요.')
       await refresh()
     } catch (err: any) {
-      setRetryMsg(`오디오 재생성 실패: ${err?.message ?? '알 수 없는 오류'}`)
+      const msg =
+        err instanceof ApiError
+          ? err.bodyText
+            ? `${err.message}\n${err.bodyText}`
+            : err.message
+          : err?.message ?? '알 수 없는 오류'
+      setRetryMsg(`오디오 재생성 실패: ${msg}`)
     } finally {
       setIsRetryingAudio(false)
     }
