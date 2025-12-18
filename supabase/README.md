@@ -19,6 +19,8 @@
    - `OPENAI_API_KEY` (텍스트/이미지/TTS 생성용)
    - (선택) `OPENAI_TEXT_MODEL` (기본: `gpt-5.2`, 폴백: `gpt-4o-mini` → `gpt-4o`)
    - (선택) `OPENAI_IMAGE_SIZE` (기본 폴백: `1792x1024` → `1024x1024`)
+   - (선택) `OPENAI_IMAGE_TIMEOUT_MS` (기본: `180000` = 3분)
+   - (선택) `OPENAI_IMAGE_MAX_ATTEMPTS` (기본: `2`, 최대: `5`)
    - (선택) `YTG_BUCKET` (기본값: `ytg-assets`)
 
 > 참고: 이 레포는 프론트에서 `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`를 사용합니다.

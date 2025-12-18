@@ -97,49 +97,57 @@ async function runRetryAudio(jobId: string) {
   const packager = jobRes.data.packager ?? null
   const fp = jobRes.data.final_package ?? null
 
-  const fullScript = String((packager as any)?.tts?.full_script ?? '').trim()
-  const fromScenes = (scenesRes.data ?? [])
-    .map((s: any) => String(s?.narration ?? '').trim())
-    .filter(Boolean)
-    .map((t: string, i: number) => `${i + 1}. ${t}`)
-    .join('\n')
+  const ttsModel = Deno.env.get('OPENAI_TTS_MODEL')?.trim() || 'gpt-4o-mini-tts'
+  const ttsVoice = Deno.env.get('OPENAI_TTS_VOICE')?.trim() || 'alloy'
 
-  const narrationText = fullScript || fromScenes
-  if (!narrationText.trim()) {
-    pushRuntimeLog(packager, 'error', '오디오 재생성 실패: TTS 스크립트가 비어있습니다.')
-    await supabase.from('ytg_jobs').update({ packager }).eq('id', jobId)
-    throw new Error('TTS script is empty')
+  const sceneRows = (scenesRes.data ?? [])
+    .map((s: any) => ({ scene_id: Number(s?.scene_id), narration: String(s?.narration ?? '').trim() }))
+    .filter((s: any) => Number.isFinite(s.scene_id) && s.narration)
+    .sort((a: any, b: any) => a.scene_id - b.scene_id)
+
+  const sceneAudioUrls: Array<{ scene_id: number; audio_url: string }> = []
+
+  if (sceneRows.length === 0) {
+    pushRuntimeLog(packager, 'error', '오디오 재생성 실패: narration이 있는 scene이 없습니다.')
+  } else {
+    for (const s of sceneRows) {
+      try {
+        pushRuntimeLog(packager, 'info', '오디오(씬) 재생성 시작', { scene_id: s.scene_id, chars: s.narration.length })
+        const mp3 = await openaiTtsMp3(s.narration)
+        const audioPath = `jobs/${jobId}/tts/scene-${String(s.scene_id).padStart(2, '0')}.mp3`
+        const up = await supabase.storage.from(bucket).upload(audioPath, new Blob([toArrayBuffer(mp3)], { type: 'audio/mpeg' }), {
+          contentType: 'audio/mpeg',
+          upsert: true,
+        })
+        if (up.error) throw new Error(up.error.message)
+        const url = supabase.storage.from(bucket).getPublicUrl(audioPath).data.publicUrl
+        sceneAudioUrls.push({ scene_id: s.scene_id, audio_url: url })
+        pushRuntimeLog(packager, 'info', '오디오(씬) 재생성 완료', { scene_id: s.scene_id, audio_url: url })
+
+        const insAsset = await supabase.from('ytg_assets').insert({
+          job_id: jobId,
+          type: 'audio',
+          path: audioPath,
+          url,
+          meta: { kind: 'scene', scene_id: s.scene_id, provider: 'openai', model: ttsModel, voice: ttsVoice, retried_at: nowIso() },
+        })
+        if (insAsset.error) pushRuntimeLog(packager, 'warn', 'ytg_assets 씬 오디오 기록 실패(무시)', { error: insAsset.error.message })
+      } catch (e: any) {
+        pushRuntimeLog(packager, 'error', '오디오(씬) 재생성 실패', { scene_id: s.scene_id, error: e?.message ?? String(e) })
+      }
+      await supabase.from('ytg_jobs').update({ packager }).eq('id', jobId)
+    }
   }
 
-  pushRuntimeLog(packager, 'info', '오디오 재생성 시작', { chars: narrationText.length })
-  const mp3 = await openaiTtsMp3(narrationText)
-  const audioPath = `jobs/${jobId}/narration.mp3`
-  const up = await supabase.storage.from(bucket).upload(audioPath, new Blob([toArrayBuffer(mp3)], { type: 'audio/mpeg' }), {
-    contentType: 'audio/mpeg',
-    upsert: true,
-  })
-  if (up.error) throw new Error(up.error.message)
-
-  const audioUrl = supabase.storage.from(bucket).getPublicUrl(audioPath).data.publicUrl
-  pushRuntimeLog(packager, 'info', '오디오 재생성 완료', { audio_url: audioUrl })
-
-  const insAsset = await supabase.from('ytg_assets').insert({
-    job_id: jobId,
-    type: 'audio',
-    path: audioPath,
-    url: audioUrl,
-    meta: { provider: 'openai', model: Deno.env.get('OPENAI_TTS_MODEL')?.trim() || 'gpt-4o-mini-tts', voice: Deno.env.get('OPENAI_TTS_VOICE')?.trim() || 'alloy', retried_at: nowIso() },
-  })
-  if (insAsset.error) {
-    pushRuntimeLog(packager, 'warn', 'ytg_assets 오디오 기록 실패(무시)', { error: insAsset.error.message })
-  }
+  // NOTE: full 트랙(전체 TTS)은 생성하지 않습니다(자원 낭비 방지). 씬별만 생성합니다.
+  const fullAudioUrl: string | null = null
 
   // best-effort: patch final_package if present
   if (fp && typeof fp === 'object') {
     const next = { ...(fp as any) }
     next.audio = next.audio ?? {}
-    next.audio.audio_url = audioUrl
-    next.audio.tts = { provider: 'openai', model: Deno.env.get('OPENAI_TTS_MODEL')?.trim() || 'gpt-4o-mini-tts', voice: Deno.env.get('OPENAI_TTS_VOICE')?.trim() || 'alloy' }
+    next.audio.scene_audios = sceneAudioUrls
+    next.audio.tts = { provider: 'openai', model: ttsModel, voice: ttsVoice }
     await supabase.from('ytg_jobs').update({ final_package: next, packager }).eq('id', jobId)
   } else {
     await supabase.from('ytg_jobs').update({ packager }).eq('id', jobId)

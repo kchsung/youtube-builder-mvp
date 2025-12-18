@@ -35,41 +35,79 @@ function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
   return u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength) as ArrayBuffer
 }
 
+async function fetchWithTimeout(input: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController()
+  const t = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    return await fetch(input, { ...init, signal: controller.signal })
+  } finally {
+    clearTimeout(t)
+  }
+}
+
+function sleepMs(ms: number) {
+  return new Promise((r) => setTimeout(r, ms))
+}
+
 async function openaiImagePng(prompt: string): Promise<Uint8Array> {
   const apiKey = requireEnv('OPENAI_API_KEY')
   const envSize = Deno.env.get('OPENAI_IMAGE_SIZE')?.trim()
   const sizes = Array.from(new Set([envSize, '1792x1024', '1024x1024'].filter(Boolean))) as string[]
+  const timeoutMs = Number(Deno.env.get('OPENAI_IMAGE_TIMEOUT_MS') ?? '180000') || 180000
+  const maxAttemptsPerSize = Math.max(1, Math.min(Number(Deno.env.get('OPENAI_IMAGE_MAX_ATTEMPTS') ?? '2') || 2, 5))
 
   let lastErr: unknown = null
   for (const size of sizes) {
-    const res = await fetch('https://api.openai.com/v1/images/generations', {
-      method: 'POST',
-      headers: { authorization: `Bearer ${apiKey}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'gpt-image-1', prompt, size }),
-    })
-    const text = await res.text()
-    if (!res.ok) {
-      lastErr = new Error(`OpenAI image error (${res.status}): ${text}`)
-      if (res.status === 400) continue
-      throw lastErr
+    for (let attempt = 1; attempt <= maxAttemptsPerSize; attempt++) {
+      let res: Response
+      let text: string
+      try {
+        res = await fetchWithTimeout(
+          'https://api.openai.com/v1/images/generations',
+          {
+            method: 'POST',
+            headers: { authorization: `Bearer ${apiKey}`, 'content-type': 'application/json' },
+            body: JSON.stringify({ model: 'gpt-image-1', prompt, size }),
+          },
+          timeoutMs,
+        )
+        text = await res.text()
+      } catch (e: any) {
+        const msg = e?.name === 'AbortError' ? `timeout after ${timeoutMs}ms` : e?.message ?? String(e)
+        lastErr = new Error(`OpenAI image request failed (${size}, attempt ${attempt}): ${msg}`)
+        await sleepMs(600 * attempt)
+        continue
+      }
+
+      if (!res.ok) {
+        lastErr = new Error(`OpenAI image error (${res.status}, size=${size}, attempt=${attempt}): ${text}`)
+        if (res.status === 400) break
+        if (res.status === 429 || res.status >= 500) {
+          await sleepMs(800 * attempt)
+          continue
+        }
+        throw lastErr
+      }
+
+      const json = JSON.parse(text)
+      const first = json?.data?.[0]
+      const b64: string | undefined = first?.b64_json
+      if (b64) {
+        const bin = atob(b64)
+        const bytes = new Uint8Array(bin.length)
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+        return bytes
+      }
+      const url: string | undefined = first?.url
+      if (url) {
+        const imgRes = await fetchWithTimeout(url, { method: 'GET' }, timeoutMs)
+        if (!imgRes.ok) throw new Error(`Failed to fetch image URL (${imgRes.status})`)
+        const ab = await imgRes.arrayBuffer()
+        return new Uint8Array(ab)
+      }
+      lastErr = new Error('OpenAI image returned neither b64_json nor url')
+      await sleepMs(400 * attempt)
     }
-    const json = JSON.parse(text)
-    const first = json?.data?.[0]
-    const b64: string | undefined = first?.b64_json
-    if (b64) {
-      const bin = atob(b64)
-      const bytes = new Uint8Array(bin.length)
-      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
-      return bytes
-    }
-    const url: string | undefined = first?.url
-    if (url) {
-      const imgRes = await fetch(url)
-      if (!imgRes.ok) throw new Error(`Failed to fetch image URL (${imgRes.status})`)
-      const ab = await imgRes.arrayBuffer()
-      return new Uint8Array(ab)
-    }
-    throw new Error('OpenAI image returned neither b64_json nor url')
   }
 
   throw lastErr ?? new Error('OpenAI image error: no valid size worked')

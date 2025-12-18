@@ -177,6 +177,20 @@ function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
   return u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength) as ArrayBuffer
 }
 
+async function fetchWithTimeout(input: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController()
+  const t = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    return await fetch(input, { ...init, signal: controller.signal })
+  } finally {
+    clearTimeout(t)
+  }
+}
+
+function sleepMs(ms: number) {
+  return new Promise((r) => setTimeout(r, ms))
+}
+
 async function openaiJson<T>(payload: any): Promise<T> {
   const apiKey = requireEnv('OPENAI_API_KEY')
   const models = getTextModelCandidates(payload?.model)
@@ -264,48 +278,74 @@ async function openaiImagePng(prompt: string): Promise<Uint8Array> {
   const apiKey = requireEnv('OPENAI_API_KEY')
   const envSize = Deno.env.get('OPENAI_IMAGE_SIZE')?.trim()
   const sizes = Array.from(new Set([envSize, '1792x1024', '1024x1024'].filter(Boolean))) as string[]
+  const timeoutMs = Number(Deno.env.get('OPENAI_IMAGE_TIMEOUT_MS') ?? '180000') || 180000
+  const maxAttemptsPerSize = Math.max(1, Math.min(Number(Deno.env.get('OPENAI_IMAGE_MAX_ATTEMPTS') ?? '2') || 2, 5))
 
   let lastErr: unknown = null
   for (const size of sizes) {
-    const res = await fetch('https://api.openai.com/v1/images/generations', {
-      method: 'POST',
-      headers: {
-        authorization: `Bearer ${apiKey}`,
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'gpt-image-1',
-        prompt,
-        size,
-      }),
-    })
-    const text = await res.text()
-    if (!res.ok) {
-      lastErr = new Error(`OpenAI image error (${res.status}): ${text}`)
-      // size/param 이슈면 다음 size로 재시도
-      if (res.status === 400) continue
-      throw lastErr
-    }
+    for (let attempt = 1; attempt <= maxAttemptsPerSize; attempt++) {
+      let res: Response
+      let text: string
+      try {
+        res = await fetchWithTimeout(
+          'https://api.openai.com/v1/images/generations',
+          {
+            method: 'POST',
+            headers: {
+              authorization: `Bearer ${apiKey}`,
+              'content-type': 'application/json',
+            },
+            body: JSON.stringify({
+              model: 'gpt-image-1',
+              prompt,
+              size,
+            }),
+          },
+          timeoutMs,
+        )
+        text = await res.text()
+      } catch (e: any) {
+        const msg = e?.name === 'AbortError' ? `timeout after ${timeoutMs}ms` : e?.message ?? String(e)
+        lastErr = new Error(`OpenAI image request failed (${size}, attempt ${attempt}): ${msg}`)
+        // timeout/network -> retry with backoff
+        await sleepMs(600 * attempt)
+        continue
+      }
 
-    const json = JSON.parse(text)
-    const first = json?.data?.[0]
-    const b64: string | undefined = first?.b64_json
-    if (b64) {
-      const bin = atob(b64)
-      const bytes = new Uint8Array(bin.length)
-      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
-      return bytes
-    }
+      if (!res.ok) {
+        lastErr = new Error(`OpenAI image error (${res.status}, size=${size}, attempt=${attempt}): ${text}`)
+        // size/param 이슈면 다음 size로 재시도
+        if (res.status === 400) break
+        // rate limit / transient -> retry
+        if (res.status === 429 || res.status >= 500) {
+          await sleepMs(800 * attempt)
+          continue
+        }
+        throw lastErr
+      }
 
-    const url: string | undefined = first?.url
-    if (url) {
-      const imgRes = await fetch(url)
-      if (!imgRes.ok) throw new Error(`Failed to fetch image URL (${imgRes.status})`)
-      const ab = await imgRes.arrayBuffer()
-      return new Uint8Array(ab)
-    }
+      const json = JSON.parse(text)
+      const first = json?.data?.[0]
+      const b64: string | undefined = first?.b64_json
+      if (b64) {
+        const bin = atob(b64)
+        const bytes = new Uint8Array(bin.length)
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+        return bytes
+      }
 
-    throw new Error('OpenAI image returned neither b64_json nor url')
+      const url: string | undefined = first?.url
+      if (url) {
+        const imgRes = await fetchWithTimeout(url, { method: 'GET' }, timeoutMs)
+        if (!imgRes.ok) throw new Error(`Failed to fetch image URL (${imgRes.status})`)
+        const ab = await imgRes.arrayBuffer()
+        return new Uint8Array(ab)
+      }
+
+      lastErr = new Error('OpenAI image returned neither b64_json nor url')
+      // unexpected shape -> retry once then give up
+      await sleepMs(400 * attempt)
+    }
   }
 
   throw lastErr ?? new Error('OpenAI image error: no valid size worked')
@@ -656,47 +696,62 @@ ${extraPrompt ?? '(없음)'}
     )
     if (insScenes.error) throw new Error(insScenes.error.message)
 
-    const assetRows: Array<Omit<DbAssetRow, 'id'>> = []
+    async function insertAssetBestEffort(row: Omit<DbAssetRow, 'id'>) {
+      const ins = await supabase.from('ytg_assets').insert(row)
+      if (ins.error) {
+        pushRuntimeLog(packager, 'warn', 'ytg_assets 기록 실패(무시)', { error: ins.error.message, row })
+      }
+    }
 
-    // 2) TTS (single track) - 오디오를 먼저 생성한다.
-    const narrationText =
-      String(packager?.tts?.full_script ?? '').trim() ||
-      scenes
-        .map((s) => s.narration?.trim())
-        .filter(Boolean)
-        .map((t, i) => `${i + 1}. ${t}`)
-        .join('\n')
+    // 2) TTS (per-scene + full track) - 오디오를 먼저 생성한다.
+    const ttsModel = Deno.env.get('OPENAI_TTS_MODEL')?.trim() || 'gpt-4o-mini-tts'
+    const ttsVoice = Deno.env.get('OPENAI_TTS_VOICE')?.trim() || 'alloy'
 
-    let audioUrl: string | null = null
-    if (narrationText.trim().length > 0) {
+    const sceneAudioUrls: Array<{ scene_id: number; audio_url: string }> = []
+    const ttsTargetScenes = scenes
+      .map((s) => ({ scene_id: s.scene_id, narration: String(s.narration ?? '').trim() }))
+      .filter((s) => s.narration.length > 0)
+
+    const rtTts: any = ensureRuntime(packager)
+    if (rtTts) {
+      rtTts.tts_scenes_total = ttsTargetScenes.length
+      rtTts.tts_scenes_done = 0
+      rtTts.tts_scenes_failed = 0
+    }
+
+    for (const s of ttsTargetScenes) {
       try {
-        pushRuntimeLog(packager, 'info', 'TTS 생성 시작', { chars: narrationText.length })
-        const mp3 = await openaiTtsMp3(narrationText)
-        const audioPath = `jobs/${jobId}/narration.mp3`
+        pushRuntimeLog(packager, 'info', 'TTS(씬) 생성 시작', { scene_id: s.scene_id, chars: s.narration.length })
+        const mp3 = await openaiTtsMp3(s.narration)
+        const audioPath = `jobs/${jobId}/tts/scene-${String(s.scene_id).padStart(2, '0')}.mp3`
         const upA = await supabase.storage.from(bucket).upload(audioPath, new Blob([toArrayBuffer(mp3)], { type: 'audio/mpeg' }), {
           contentType: 'audio/mpeg',
           upsert: true,
         })
         if (upA.error) throw new Error(upA.error.message)
-        audioUrl = supabase.storage.from(bucket).getPublicUrl(audioPath).data.publicUrl
-        assetRows.push({
+        const url = supabase.storage.from(bucket).getPublicUrl(audioPath).data.publicUrl
+        sceneAudioUrls.push({ scene_id: s.scene_id, audio_url: url })
+        await insertAssetBestEffort({
           job_id: jobId,
           type: 'audio',
           path: audioPath,
-          url: audioUrl,
-          meta: { provider: 'openai', model: 'gpt-4o-mini-tts', voice: 'alloy' },
+          url,
+          meta: { kind: 'scene', scene_id: s.scene_id, provider: 'openai', model: ttsModel, voice: ttsVoice },
         })
-        pushRuntimeLog(packager, 'info', 'TTS 생성 완료', { audio_url: audioUrl })
+        if (rtTts) rtTts.tts_scenes_done = (rtTts.tts_scenes_done ?? 0) + 1
+        pushRuntimeLog(packager, 'info', 'TTS(씬) 생성 완료', { scene_id: s.scene_id, audio_url: url })
       } catch (e: any) {
         const msg = e?.message ?? String(e)
-        pushRuntimeLog(packager, 'error', 'TTS 생성 실패 - 오디오 없이 계속 진행합니다.', { error: msg })
-        audioUrl = null
+        if (rtTts) rtTts.tts_scenes_failed = (rtTts.tts_scenes_failed ?? 0) + 1
+        pushRuntimeLog(packager, 'error', 'TTS(씬) 생성 실패', { scene_id: s.scene_id, error: msg })
+        // keep going
       }
-    } else {
-      pushRuntimeLog(packager, 'error', 'TTS 스크립트가 비어 있어 오디오 생성을 건너뜁니다.', {
-        hint: 'packager.tts.full_script 또는 scenes[n].narration이 비어있습니다.',
-      })
+      // progress is useful; persist packager runtime occasionally
+      await supabase.from('ytg_jobs').update({ packager }).eq('id', jobId)
     }
+
+    // NOTE: full 트랙(전체 TTS)은 생성하지 않습니다(자원 낭비 방지). 씬별만 생성합니다.
+    const audioUrl: string | null = null
 
     // 3) per-scene image generation + upload + update rows (오디오 이후)
     const validSceneIds = new Set(scenes.map((s) => s.scene_id))
@@ -748,7 +803,7 @@ ${extraPrompt ?? '(없음)'}
             .eq('scene_id', sceneId)
           if (upd.error) throw new Error(upd.error.message)
 
-          assetRows.push({
+          await insertAssetBestEffort({
             job_id: jobId,
             type: 'image',
             path,
@@ -762,26 +817,26 @@ ${extraPrompt ?? '(없음)'}
           const msg = e?.message ?? String(e)
           imagesErrors.push({ scene_id: sceneId, error: msg })
           pushRuntimeLog(packager, 'error', '이미지 생성 실패', { scene_id: sceneId, error: msg })
+        } finally {
+          // 실행 중 진행률이 화면에 뜨도록 자주 저장
+          const rt = ensureRuntime(packager)
+          rt.images_success = imagesSuccess
+          rt.images_failed = imagesFailed
+          rt.images_skipped = imagesSkipped
+          rt.images_errors = imagesErrors
+          await supabase.from('ytg_jobs').update({ packager }).eq('id', jobId)
         }
       }
     }
 
-    const rt = ensureRuntime(packager)
-    rt.images_success = imagesSuccess
-    rt.images_failed = imagesFailed
-    rt.images_skipped = imagesSkipped
-    rt.images_errors = imagesErrors
-    await supabase.from('ytg_jobs').update({ packager }).eq('id', jobId)
-
-    // 4) assets insert
-    assetRows.push({
+    // 4) assets insert (json marker only)
+    const insAssets = await supabase.from('ytg_assets').insert({
       job_id: jobId,
       type: 'json',
       path: null,
       url: null,
       meta: { note: 'final_package is stored in jobs.final_package', trace_id: traceId },
     })
-    const insAssets = await supabase.from('ytg_assets').insert(assetRows)
     if (insAssets.error) throw new Error(insAssets.error.message)
 
     // 5) final_package + job succeed
@@ -804,7 +859,8 @@ ${extraPrompt ?? '(없음)'}
       })),
       audio: {
         audio_url: audioUrl,
-        tts: { provider: 'openai', model: 'gpt-4o-mini-tts', voice: 'alloy' },
+        scene_audios: sceneAudioUrls,
+        tts: { provider: 'openai', model: ttsModel, voice: ttsVoice },
       },
       meta: { storage_bucket: bucket, supabase_url: supabaseUrl, trace_id: traceId },
     }

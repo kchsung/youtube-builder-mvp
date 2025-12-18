@@ -34,6 +34,7 @@ function extractErrorMessage(bodyJson: unknown): string | undefined {
 export async function functionsPost<TResponse, TBody extends JsonValue>(
   path: string,
   body: TBody,
+  init?: RequestInit,
 ): Promise<TResponse> {
   const env = getEnv()
   const url = `${env.functionsBase.replace(/\/$/, '')}/${path.replace(/^\//, '')}`
@@ -43,8 +44,10 @@ export async function functionsPost<TResponse, TBody extends JsonValue>(
       'content-type': 'application/json',
       apikey: env.supabaseAnonKey,
       authorization: `Bearer ${env.supabaseAnonKey}`,
+      ...(init?.headers ?? {}),
     },
     body: JSON.stringify(body),
+    signal: init?.signal,
   })
 
   const text = await res.text()
@@ -62,7 +65,7 @@ export async function functionsPost<TResponse, TBody extends JsonValue>(
   return JSON.parse(text) as TResponse
 }
 
-export async function functionsGet<TResponse>(pathWithQuery: string): Promise<TResponse> {
+export async function functionsGet<TResponse>(pathWithQuery: string, init?: RequestInit): Promise<TResponse> {
   const env = getEnv()
   const url = `${env.functionsBase.replace(/\/$/, '')}/${pathWithQuery.replace(/^\//, '')}`
   const res = await fetch(url, {
@@ -70,7 +73,9 @@ export async function functionsGet<TResponse>(pathWithQuery: string): Promise<TR
     headers: {
       apikey: env.supabaseAnonKey,
       authorization: `Bearer ${env.supabaseAnonKey}`,
+      ...(init?.headers ?? {}),
     },
+    signal: init?.signal,
   })
   const text = await res.text()
   if (!res.ok) {

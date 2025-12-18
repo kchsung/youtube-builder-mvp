@@ -63,6 +63,9 @@ export function HomePage() {
     if (!canSubmit) return
     setIsSubmitting(true)
     setError(null)
+    const controller = new AbortController()
+    const timeoutMs = 20000
+    const t = window.setTimeout(() => controller.abort(), timeoutMs)
     try {
       const payload: TrendStoryStartRequest = {
         topic_domain: topicDomain.trim(),
@@ -70,15 +73,22 @@ export function HomePage() {
         audience: audience.trim() || '중학생',
         input_as_text: inputAsText.trim() || undefined,
       }
-      const res = await functionsPost<TrendStoryStartResponse, any>('trendstory-start', payload as any)
+      const res = await functionsPost<TrendStoryStartResponse, any>('trendstory-start', payload as any, {
+        signal: controller.signal,
+      })
       nav(`/jobs/${res.job_id}`)
     } catch (err: any) {
+      if (err?.name === 'AbortError') {
+        setError(`요청 시간이 초과되었습니다. (${Math.round(timeoutMs / 1000)}초)`)
+        return
+      }
       if (err instanceof ApiError) {
         setError(err.bodyText ? `${err.message}\n${err.bodyText}` : err.message)
       } else {
         setError(err?.message ?? '요청 중 오류가 발생했습니다.')
       }
     } finally {
+      window.clearTimeout(t)
       setIsSubmitting(false)
     }
   }
