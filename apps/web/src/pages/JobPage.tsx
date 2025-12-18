@@ -252,7 +252,7 @@ export function JobPage() {
             </button>
             <button
               onClick={() => regenerateAllImagesSequential()}
-              disabled={isRetryingImages}
+              disabled={true}
               className="btn-dark h-10"
               title="모든 씬을 순서대로 1개씩 다시 생성합니다(이미 있어도 덮어쓸 수 있음)."
             >
