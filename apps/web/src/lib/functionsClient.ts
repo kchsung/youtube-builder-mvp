@@ -31,6 +31,13 @@ function extractErrorMessage(bodyJson: unknown): string | undefined {
   return typeof msg === 'string' && msg.trim() ? msg.trim() : undefined
 }
 
+export function extractErrorHint(bodyJson: unknown): string | undefined {
+  if (!bodyJson || typeof bodyJson !== 'object') return undefined
+  const anyBody = bodyJson as any
+  const hint = anyBody?.hint
+  return typeof hint === 'string' && hint.trim() ? hint.trim() : undefined
+}
+
 export async function functionsPost<TResponse, TBody extends JsonValue>(
   path: string,
   body: TBody,

@@ -28,7 +28,9 @@ function requireEnv(name: string) {
 function getSupabaseServiceClient() {
   const url = requireEnv('SUPABASE_URL')
   const serviceRoleKey = requireEnv('SUPABASE_SERVICE_ROLE_KEY')
-  return createClient(url, serviceRoleKey)
+  return createClient(url, serviceRoleKey, {
+    db: { schema: 'public' },
+  })
 }
 
 function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
@@ -144,6 +146,29 @@ async function claimSceneImageGeneration(args: { supabase: any; jobId: string; s
   // - never claimed (status is null)
   // - not generating
   // - generating but stale
+  // 먼저 현재 상태를 확인
+  const check = await supabase
+    .from('ytg_scenes')
+    .select('id, image_gen_status, image_gen_started_at')
+    .eq('job_id', jobId)
+    .eq('scene_id', sceneId)
+    .single()
+
+  if (check.error) throw new Error(check.error.message)
+  if (!check.data) return false
+
+  const currentStatus = check.data.image_gen_status
+  const startedAt = check.data.image_gen_started_at
+
+  // Claim 가능한지 확인
+  const canClaim =
+    currentStatus === null ||
+    currentStatus !== 'GENERATING' ||
+    (startedAt && new Date(startedAt) < new Date(staleBeforeIso))
+
+  if (!canClaim) return false
+
+  // Claim 실행
   const upd = await supabase
     .from('ytg_scenes')
     .update({
@@ -154,7 +179,7 @@ async function claimSceneImageGeneration(args: { supabase: any; jobId: string; s
     })
     .eq('job_id', jobId)
     .eq('scene_id', sceneId)
-    .or(`image_gen_status.is.null,image_gen_status.neq.GENERATING,image_gen_started_at.lt.${staleBeforeIso}`)
+    .eq('id', check.data.id)
     .select('id')
 
   if (upd.error) throw new Error(upd.error.message)

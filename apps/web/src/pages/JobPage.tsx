@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
-import { ApiError, functionsGet, functionsPost } from '../lib/functionsClient'
+import { ApiError, extractErrorHint, functionsGet, functionsPost } from '../lib/functionsClient'
 import { copyText, downloadFileFromUrl, downloadJson, downloadScenesImagesZip } from '../lib/clientUtils'
 import type {
   TrendStoryGenerateSceneImageRequest,
@@ -86,12 +86,21 @@ export function JobPage() {
       else if (res.status === 'FAILED') setRetryMsg(`Scene ${sceneId}: 이미지 생성 실패: ${res.message ?? '알 수 없는 오류'}`)
       await refresh()
     } catch (err: any) {
-      const msg =
+      let msg =
         err instanceof ApiError
           ? err.bodyText
             ? `${err.message}\n${err.bodyText}`
             : err.message
           : err?.message ?? '알 수 없는 오류'
+      
+      // 서버에서 제공한 hint가 있으면 추가
+      if (err instanceof ApiError && err.bodyJson) {
+        const hint = extractErrorHint(err.bodyJson)
+        if (hint) {
+          msg = `${msg}\n\n💡 해결 방법:\n${hint}`
+        }
+      }
+      
       setRetryMsg(`Scene ${sceneId}: 이미지 생성 실패: ${msg}`)
     } finally {
       setGeneratingSceneIds((m) => {
@@ -348,8 +357,12 @@ export function JobPage() {
         </div>
 
         {isLoading ? <div className="text-sm text-zinc-400">불러오는 중...</div> : null}
-        {error ? <div className="text-sm text-red-300">오류: {error}</div> : null}
-        {retryMsg ? <div className="text-sm text-zinc-300">{retryMsg}</div> : null}
+        {error ? <div className="whitespace-pre-wrap text-sm text-red-300">오류: {error}</div> : null}
+        {retryMsg ? (
+          <div className={`whitespace-pre-wrap text-sm ${retryMsg.includes('실패') || retryMsg.includes('오류') ? 'text-red-300' : 'text-zinc-300'}`}>
+            {retryMsg}
+          </div>
+        ) : null}
         {data?.status === 'FAILED' ? (
           <div className="rounded-xl border border-red-500/30 bg-red-500/10 p-4 text-sm text-red-200">
             실패: {data.job.error ?? '알 수 없는 오류'}
