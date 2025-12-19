@@ -11,3 +11,4 @@ YouTube 영상 생성(TrendStory) MVP 프로젝트입니다.
 - `apps/web/env.local` 및 `.env*` 파일은 **커밋하지 않습니다** (비밀키/토큰 포함 가능)
 
 
+

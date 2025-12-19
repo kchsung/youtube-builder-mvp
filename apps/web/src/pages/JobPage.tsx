@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router-dom'
 import { ApiError, functionsGet, functionsPost } from '../lib/functionsClient'
 import { copyText, downloadFileFromUrl, downloadJson, downloadScenesImagesZip } from '../lib/clientUtils'
 import type {
-  TrendStoryRetryImagesRequest,
-  TrendStoryRetryImagesResponse,
+  TrendStoryGenerateSceneImageRequest,
+  TrendStoryGenerateSceneImageResponse,
   TrendStoryRetryAudioRequest,
   TrendStoryRetryAudioResponse,
+  TrendStoryStartRequest,
+  TrendStoryStartResponse,
   TrendStoryStatusResponse,
 } from '../lib/types'
 import { Shell } from '../ui/Shell'
@@ -22,21 +24,35 @@ function formatStatus(status: string) {
 export function JobPage() {
   const { id } = useParams()
   const jobId = id ?? ''
+  const nav = useNavigate()
   const [data, setData] = useState<TrendStoryStatusResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [pollingBlocked, setPollingBlocked] = useState(false)
   const [retryMsg, setRetryMsg] = useState<string | null>(null)
-  const [isRetryingImages, setIsRetryingImages] = useState(false)
   const [isRetryingAudio, setIsRetryingAudio] = useState(false)
   const [isDownloadingZip, setIsDownloadingZip] = useState(false)
+  const [generatingSceneIds, setGeneratingSceneIds] = useState<Record<number, boolean>>({})
+  const [selectedAudioSceneIds, setSelectedAudioSceneIds] = useState<Set<number>>(new Set())
+  const [showAudioRetryModal, setShowAudioRetryModal] = useState(false)
+  const [isRestarting, setIsRestarting] = useState(false)
 
   const status = data?.status
-  const isPolling = !pollingBlocked && (status === 'QUEUED' || status === 'RUNNING' || !status)
+  const isAnySceneGenerating = useMemo(
+    () => Object.values(generatingSceneIds).some(Boolean),
+    [generatingSceneIds],
+  )
 
-  async function refresh() {
+  // NOTE:
+  // - 이미지는 자동 생성되지 않습니다. (씬별로 "생성" 클릭 시 1장씩 생성)
+  // - 생성 클릭 후에는 완료까지 화면이 갱신되도록, 로컬 생성 상태 동안은 폴링을 유지합니다.
+  const isPolling =
+    !pollingBlocked && (status === 'QUEUED' || status === 'RUNNING' || !status || isAnySceneGenerating)
+
+  async function refresh(showLoading = false) {
     if (!jobId) return
     setError(null)
+    if (showLoading) setIsLoading(true)
     try {
       const res = await functionsGet<TrendStoryStatusResponse>(`trendstory-status?job_id=${encodeURIComponent(jobId)}`)
       setData(res)
@@ -54,18 +70,21 @@ export function JobPage() {
     }
   }
 
-  async function retryMissingImages(sceneIds?: number[]) {
+  async function generateSceneImage(sceneId: number, force = false) {
     if (!jobId) return
     setRetryMsg(null)
-    setIsRetryingImages(true)
+    setGeneratingSceneIds((m) => ({ ...m, [sceneId]: true }))
     try {
-      const body: TrendStoryRetryImagesRequest = {
+      const body: TrendStoryGenerateSceneImageRequest = {
         job_id: jobId,
-        scene_ids: sceneIds && sceneIds.length > 0 ? sceneIds : undefined,
-        missing_only: !sceneIds || sceneIds.length === 0 ? true : false,
+        scene_id: sceneId,
+        force,
       }
-      const res = await functionsPost<TrendStoryRetryImagesResponse, any>('trendstory-retry-images', body as any)
-      setRetryMsg(`이미지 재시도: 성공 ${res.succeeded} / 실패 ${res.failed} (시도 ${res.attempted})`)
+      const res = await functionsPost<TrendStoryGenerateSceneImageResponse, any>('trendstory-generate-scene-image', body as any)
+      if (res.status === 'IN_PROGRESS') setRetryMsg(`Scene ${sceneId}: 이미 생성 중입니다.`)
+      else if (res.status === 'ALREADY_EXISTS') setRetryMsg(`Scene ${sceneId}: 이미 생성된 이미지가 있습니다.`)
+      else if (res.status === 'SUCCEEDED') setRetryMsg(`Scene ${sceneId}: 이미지 생성 완료`)
+      else if (res.status === 'FAILED') setRetryMsg(`Scene ${sceneId}: 이미지 생성 실패: ${res.message ?? '알 수 없는 오류'}`)
       await refresh()
     } catch (err: any) {
       const msg =
@@ -74,9 +93,13 @@ export function JobPage() {
             ? `${err.message}\n${err.bodyText}`
             : err.message
           : err?.message ?? '알 수 없는 오류'
-      setRetryMsg(`이미지 재시도 실패: ${msg}`)
+      setRetryMsg(`Scene ${sceneId}: 이미지 생성 실패: ${msg}`)
     } finally {
-      setIsRetryingImages(false)
+      setGeneratingSceneIds((m) => {
+        const next = { ...m }
+        delete next[sceneId]
+        return next
+      })
     }
   }
 
@@ -84,14 +107,32 @@ export function JobPage() {
 
   // NOTE: "전체 이미지 다시 생성" 버튼은 제거했습니다.
 
-  async function retryAudio() {
+  async function retryAudio(selectedSceneIds?: number[]) {
     if (!jobId) return
     setRetryMsg(null)
     setIsRetryingAudio(true)
+    setShowAudioRetryModal(false)
     try {
-      const body: TrendStoryRetryAudioRequest = { job_id: jobId, force: true }
+      // 생성되지 않은 씬도 자동 포함: 모든 씬에서 생성된 씬을 제외하고 나머지를 추가
+      const allSceneIds = (data?.scenes ?? []).map((s) => s.scene_id)
+      const existingAudioSceneIds = new Set(sceneAudios.map((a: { scene_id: number }) => a.scene_id))
+      const missingSceneIds = allSceneIds.filter((id) => !existingAudioSceneIds.has(id))
+
+      // 선택된 씬 + 생성되지 않은 씬 모두 포함
+      // 선택된 씬이 없어도 생성되지 않은 씬만 재생성 가능
+      const finalSceneIds = missingSceneIds.length > 0 || (selectedSceneIds && selectedSceneIds.length > 0)
+        ? Array.from(new Set([...(selectedSceneIds ?? []), ...missingSceneIds]))
+        : undefined
+
+      const body: TrendStoryRetryAudioRequest = {
+        job_id: jobId,
+        force: true,
+        scene_ids: finalSceneIds,
+      }
       const res = await functionsPost<TrendStoryRetryAudioResponse, any>('trendstory-retry-audio', body as any)
-      setRetryMsg(res.message || '오디오 재생성을 시작했습니다. 잠시 후 새로고침 해주세요.')
+      const sceneCount = finalSceneIds?.length ?? allSceneIds.length
+      setRetryMsg(res.message || `오디오 재생성을 시작했습니다 (${sceneCount}개 씬, 생성 안 된 ${missingSceneIds.length}개 자동 포함). 잠시 후 새로고침 해주세요.`)
+      setSelectedAudioSceneIds(new Set())
       await refresh()
     } catch (err: any) {
       const msg =
@@ -160,14 +201,27 @@ export function JobPage() {
       }))
       .filter((x) => Number.isFinite(x.scene_id) && Boolean(x.audio_url))
       .sort((a, b) => a.scene_id - b.scene_id)
-    if (fromAssets.length > 0) return fromAssets
+    if (fromAssets.length > 0) {
+      // NOTE: 재생성/재시도 누적으로 동일 scene_id가 중복될 수 있어 dedupe 합니다.
+      // scene_id별로 "마지막 항목"을 사용합니다(대개 최신 업로드가 뒤에 쌓임).
+      const byScene = new Map<number, string>()
+      for (const a of fromAssets) byScene.set(a.scene_id, a.audio_url)
+      return Array.from(byScene.entries())
+        .map(([scene_id, audio_url]) => ({ scene_id, audio_url }))
+        .sort((a, b) => a.scene_id - b.scene_id)
+    }
 
     const fp: any = data?.job?.final_package
     const fromFp = Array.isArray(fp?.audio?.scene_audios) ? fp.audio.scene_audios : []
-    return fromFp
+    const cleaned = fromFp
       .map((x: any) => ({ scene_id: Number(x?.scene_id), audio_url: String(x?.audio_url ?? '') }))
       .filter((x: any) => Number.isFinite(x.scene_id) && x.audio_url)
       .sort((a: any, b: any) => a.scene_id - b.scene_id)
+    const byScene = new Map<number, string>()
+    for (const a of cleaned) byScene.set(a.scene_id, a.audio_url)
+    return Array.from(byScene.entries())
+      .map(([scene_id, audio_url]) => ({ scene_id, audio_url }))
+      .sort((a, b) => a.scene_id - b.scene_id)
   }, [data])
 
   const [autoPlayScenes, setAutoPlayScenes] = useState(false)
@@ -194,7 +248,15 @@ export function JobPage() {
     const imagesDone = scenes.filter((s) => Boolean(s.image_url)).length
     const audioDone = Boolean(audioUrl)
     const sceneAudiosDone = sceneAudios.length
+
+    // packager._runtime에서 상태 읽기
+    const pk: any = packager
+    const autoconfigStatus = pk?._runtime?.autoconfig_status ?? (autoconfig ? 'done' : 'waiting')
+    const packagerStatus = pk?._runtime?.packager_status ?? (packager ? 'done' : 'waiting')
+
     return {
+      autoconfigStatus: autoconfigStatus as 'waiting' | 'running' | 'done',
+      packagerStatus: packagerStatus as 'waiting' | 'running' | 'done',
       autoconfigDone: Boolean(autoconfig),
       packagerDone: Boolean(packager),
       scenesCount: scenes.length,
@@ -204,9 +266,52 @@ export function JobPage() {
     }
   }, [data, autoconfig, packager, audioUrl, sceneAudios])
 
+  function formatStepStatus(status: 'waiting' | 'running' | 'done'): string {
+    if (status === 'done') return '완료'
+    if (status === 'running') return '진행중'
+    return '대기'
+  }
+
   async function copyHashtags() {
     const tags: unknown = youtubeMeta?.hashtags
     if (Array.isArray(tags)) await copyText(tags.join(' '))
+  }
+
+  async function restartJob() {
+    if (!jobId || !data?.job?.input) return
+    setIsRestarting(true)
+    setRetryMsg(null)
+    setError(null)
+    try {
+      const input = data.job.input as any
+      const payload: TrendStoryStartRequest = {
+        topic_domain: String(input?.topic_domain ?? '').trim(),
+        language: String(input?.language ?? 'ko').trim(),
+        audience: String(input?.audience ?? '중학생').trim(),
+        input_as_text: input?.input_as_text ? String(input.input_as_text).trim() : undefined,
+        job_id: jobId, // 기존 job 재사용
+      }
+      if (!payload.topic_domain) {
+        setError('기존 job의 입력 정보가 없습니다.')
+        return
+      }
+      await functionsPost<TrendStoryStartResponse, any>('trendstory-start', payload as any)
+      setRetryMsg('작업을 재시작했습니다. 잠시 후 새로고침됩니다...')
+      // 같은 페이지에서 새로고침
+      setTimeout(() => {
+        refresh()
+      }, 1500)
+    } catch (err: any) {
+      const msg =
+        err instanceof ApiError
+          ? err.bodyText
+            ? `${err.message}\n${err.bodyText}`
+            : err.message
+          : err?.message ?? '재시작 중 오류가 발생했습니다.'
+      setError(msg)
+    } finally {
+      setIsRestarting(false)
+    }
   }
 
   return (
@@ -225,10 +330,20 @@ export function JobPage() {
 
           <div className="flex flex-wrap gap-2">
             <button
-              onClick={() => refresh()}
+              onClick={() => refresh(true)}
+              disabled={isLoading}
               className="btn-ghost h-10"
+              title="최신 상태로 새로고침"
             >
-              새로고침
+              {isLoading ? '새로고침 중...' : '새로고침'}
+            </button>
+            <button
+              onClick={() => restartJob()}
+              disabled={isRestarting || !data?.job?.input}
+              className="btn-dark h-10 px-4"
+              title="기존 입력으로 새 작업을 시작합니다"
+            >
+              {isRestarting ? '재시작 중...' : '전체 새로만들기'}
             </button>
           </div>
         </div>
@@ -246,8 +361,8 @@ export function JobPage() {
           <div className="rounded-xl border border-white/10 bg-white/5 p-4 text-sm text-zinc-300">
             생성 작업이 진행 중입니다. 2~3초 간격으로 자동 갱신합니다.
             <div className="mt-2 grid gap-1 text-xs text-zinc-400">
-              <div>autoconfig: {progress.autoconfigDone ? '완료' : '대기'}</div>
-              <div>packager: {progress.packagerDone ? '완료' : '대기'}</div>
+              <div>autoconfig: {formatStepStatus(progress.autoconfigStatus)}</div>
+              <div>packager: {formatStepStatus(progress.packagerStatus)}</div>
               <div>scenes: {progress.scenesCount}개</div>
               <div>images: {progress.imagesDone}/{progress.scenesCount}</div>
               <div>audio: {progress.audioDone ? '완료' : '대기'}</div>
@@ -303,13 +418,23 @@ export function JobPage() {
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <h2 className="text-base font-semibold">오디오 내레이션</h2>
                 <div className="flex flex-wrap items-center gap-3">
-                  <button
-                    onClick={() => retryAudio()}
-                    disabled={isRetryingAudio}
-                    className="btn-dark h-9 px-3 text-xs"
-                  >
-                    {isRetryingAudio ? '오디오 생성 중...' : '오디오 재생성'}
-                  </button>
+                  {sceneAudios.length > 0 ? (
+                    <button
+                      onClick={() => setShowAudioRetryModal(true)}
+                      disabled={isRetryingAudio}
+                      className="btn-dark h-9 px-3 text-xs"
+                    >
+                      {isRetryingAudio ? '오디오 생성 중...' : '오디오 재생성'}
+                    </button>
+                  ) : (
+                    <button
+                      onClick={() => retryAudio()}
+                      disabled={isRetryingAudio}
+                      className="btn-dark h-9 px-3 text-xs"
+                    >
+                      {isRetryingAudio ? '오디오 생성 중...' : '오디오 재생성'}
+                    </button>
+                  )}
                   {audioUrl ? (
                     <a
                       href={audioUrl}
@@ -322,6 +447,94 @@ export function JobPage() {
                   ) : null}
                 </div>
               </div>
+              {showAudioRetryModal ? (
+                <div className="mt-3 rounded-xl border border-white/10 bg-zinc-950/60 p-4">
+                  <div className="mb-3 text-sm font-semibold">재생성할 오디오 선택</div>
+                  <div className="mb-2 text-xs text-zinc-400">
+                    생성되지 않은 씬은 자동으로 포함됩니다.
+                  </div>
+                  <div className="mb-3 grid gap-2 max-h-[200px] overflow-auto">
+                    {sceneAudios.map((a: { scene_id: number; audio_url: string }) => (
+                      <label key={a.scene_id} className="flex items-center gap-2 text-sm text-zinc-300">
+                        <input
+                          type="checkbox"
+                          className="h-4 w-4"
+                          checked={selectedAudioSceneIds.has(a.scene_id)}
+                          onChange={(e) => {
+                            const next = new Set(selectedAudioSceneIds)
+                            if (e.target.checked) {
+                              next.add(a.scene_id)
+                            } else {
+                              next.delete(a.scene_id)
+                            }
+                            setSelectedAudioSceneIds(next)
+                          }}
+                        />
+                        <span>Scene {a.scene_id} (재생성)</span>
+                      </label>
+                    ))}
+                    {(data?.scenes ?? []).length > sceneAudios.length && (
+                      <div className="mt-2 pt-2 border-t border-white/10">
+                        <div className="text-xs text-zinc-500 mb-1">자동 포함 (생성 안 됨):</div>
+                        {(data?.scenes ?? [])
+                          .filter((s) => !sceneAudios.some((a: { scene_id: number }) => a.scene_id === s.scene_id))
+                          .map((s) => (
+                            <div key={s.scene_id} className="text-xs text-zinc-400 ml-6">
+                              Scene {s.scene_id}
+                            </div>
+                          ))}
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      onClick={() => {
+                        const allIds = sceneAudios.map((a: { scene_id: number }) => a.scene_id)
+                        setSelectedAudioSceneIds(new Set(allIds))
+                      }}
+                      className="btn-ghost h-8 px-3 text-xs"
+                    >
+                      전체 선택
+                    </button>
+                    <button
+                      onClick={() => setSelectedAudioSceneIds(new Set())}
+                      className="btn-ghost h-8 px-3 text-xs"
+                    >
+                      전체 해제
+                    </button>
+                    <button
+                      onClick={() => retryAudio(Array.from(selectedAudioSceneIds))}
+                      disabled={isRetryingAudio}
+                      className="btn-primary h-8 px-3 text-xs"
+                    >
+                      {(() => {
+                        const allSceneIds = (data?.scenes ?? []).map((s) => s.scene_id)
+                        const existingAudioSceneIds = new Set(sceneAudios.map((a: { scene_id: number }) => a.scene_id))
+                        const missingCount = allSceneIds.filter((id) => !existingAudioSceneIds.has(id)).length
+                        const selectedCount = selectedAudioSceneIds.size
+                        if (selectedCount === 0 && missingCount > 0) {
+                          return `생성 안 된 ${missingCount}개 재생성`
+                        } else if (selectedCount > 0 && missingCount > 0) {
+                          return `선택 ${selectedCount}개 + 생성 안 된 ${missingCount}개 재생성`
+                        } else if (selectedCount > 0) {
+                          return `선택한 ${selectedCount}개 재생성`
+                        } else {
+                          return '재생성'
+                        }
+                      })()}
+                    </button>
+                    <button
+                      onClick={() => {
+                        setShowAudioRetryModal(false)
+                        setSelectedAudioSceneIds(new Set())
+                      }}
+                      className="btn-ghost h-8 px-3 text-xs"
+                    >
+                      취소
+                    </button>
+                  </div>
+                </div>
+              ) : null}
               {sceneAudios.length > 0 ? (
                 <div className="mt-3 grid gap-3">
                   <div className="flex flex-wrap items-center justify-between gap-3 text-xs text-zinc-400">
@@ -348,7 +561,7 @@ export function JobPage() {
                   <div className="grid gap-2">
                     {sceneAudios.map((a: { scene_id: number; audio_url: string }, idx: number) => (
                       <button
-                        key={`${a.scene_id}-${a.audio_url}`}
+                        key={a.scene_id}
                         onClick={() => {
                           setSceneAudioIdx(idx)
                           setAutoPlayScenes(true)
@@ -447,17 +660,6 @@ export function JobPage() {
                 <h2 className="text-base font-semibold">씬</h2>
                 <div className="flex flex-wrap items-center gap-2">
                   <button
-                    onClick={() => retryMissingImages()}
-                    disabled={isRetryingImages}
-                    className="grid h-9 w-9 place-items-center rounded-lg border border-white/10 bg-zinc-900 text-zinc-200 hover:bg-zinc-800 disabled:opacity-50"
-                    title="누락 이미지 재시도"
-                  >
-                    <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2">
-                      <path d="M3 12a9 9 0 1 0 3-6.7" />
-                      <path d="M3 3v6h6" />
-                    </svg>
-                  </button>
-                  <button
                     onClick={() => downloadAllImagesZip()}
                     disabled={isDownloadingZip}
                     className="btn-dark h-9 px-3 text-xs"
@@ -472,9 +674,25 @@ export function JobPage() {
                   <div key={s.id} className="overflow-hidden rounded-2xl border border-white/10 bg-zinc-950">
                     <div className="grid gap-4 p-4 md:grid-cols-[240px_1fr]">
                       <div className="relative aspect-video w-full overflow-hidden rounded-xl border border-white/10 bg-black/40">
+                        {Boolean(generatingSceneIds[s.scene_id]) ? (
+                          <div className="absolute inset-0 grid place-items-center bg-black/40 text-xs text-zinc-200">
+                            생성 중...
+                          </div>
+                        ) : null}
                         {s.image_url ? (
                           <>
                             <img src={s.image_url} alt={`scene ${s.scene_id}`} className="h-full w-full object-cover" />
+                            <button
+                              onClick={() => generateSceneImage(s.scene_id, true)}
+                              disabled={Boolean(generatingSceneIds[s.scene_id])}
+                              className="absolute left-2 top-2 grid h-9 w-9 place-items-center rounded-lg border border-white/10 bg-black/60 text-white hover:bg-black/80 disabled:opacity-50"
+                              title="이미지 재생성"
+                            >
+                              <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2">
+                                <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+                                <path d="M21 3v6h-6" />
+                              </svg>
+                            </button>
                             <button
                               onClick={() => downloadFileFromUrl(s.image_url!, `scene-${String(s.scene_id).padStart(2, '0')}.png`)}
                               className="absolute right-2 top-2 grid h-9 w-9 place-items-center rounded-lg border border-white/10 bg-black/60 text-white hover:bg-black/80"
@@ -491,11 +709,15 @@ export function JobPage() {
                           <div className="grid h-full place-items-center gap-2 p-3 text-xs text-zinc-500">
                             <div>이미지 없음</div>
                             <button
-                              onClick={() => retryMissingImages([s.scene_id])}
-                              disabled={isRetryingImages}
-                              className="h-8 rounded-lg border border-white/10 bg-zinc-900 px-3 text-xs text-zinc-200 hover:bg-zinc-800 disabled:opacity-50"
+                              onClick={() => generateSceneImage(s.scene_id, false)}
+                              disabled={Boolean(generatingSceneIds[s.scene_id])}
+                              className="grid h-10 w-10 place-items-center rounded-xl border border-white/10 bg-zinc-900 text-zinc-200 hover:bg-zinc-800 disabled:opacity-50"
+                              title="이미지 생성"
                             >
-                              {isRetryingImages ? '생성 중...' : '이 씬만 생성'}
+                              <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2">
+                                <path d="M12 2l1.5 5.5L19 9l-5.5 1.5L12 16l-1.5-5.5L5 9l5.5-1.5L12 2z" />
+                                <path d="M19 13l.8 3 3 .8-3 .8-.8 3-.8-3-3-.8 3-.8.8-3z" />
+                              </svg>
                             </button>
                           </div>
                         )}

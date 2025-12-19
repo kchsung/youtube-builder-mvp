@@ -47,6 +47,28 @@ function isModelAccessError(errText: string) {
   return false
 }
 
+function pickJwtKey(keys: Array<string | null | undefined>) {
+  for (const k of keys) {
+    const t = (k ?? '').trim()
+    if (!t) continue
+    if (t.split('.').length >= 3) return t
+  }
+  for (const k of keys) {
+    const t = (k ?? '').trim()
+    if (t) return t
+  }
+  return ''
+}
+
+function buildEdgeFunctionAuthHeaders(key: string) {
+  const t = (key ?? '').trim()
+  if (!t) return { ok: false, headers: { 'content-type': 'application/json' } as Record<string, string>, jwtLike: false }
+  const jwtLike = t.split('.').length >= 3
+  const headers: Record<string, string> = { apikey: t, 'content-type': 'application/json' }
+  if (jwtLike) headers.Authorization = `Bearer ${t}`
+  return { ok: true, headers, jwtLike }
+}
+
 // ---- Supabase clients (단일 파일 배포를 위해 index.ts에 포함) ----
 function getSupabaseAnonClient(req: Request) {
   const url = requireEnv('SUPABASE_URL')
@@ -101,6 +123,7 @@ type TrendStoryStartRequest = {
   language: string
   audience: string
   input_as_text?: string
+  job_id?: string // 기존 job 재사용 시 (재시작)
 }
 
 type TrendStoryStartResponse = {
@@ -131,7 +154,14 @@ function extractJsonObjectFromText(text: string): unknown {
   const s = text.trim()
   // 1) plain JSON
   try {
-    return JSON.parse(stripJsonFences(s))
+    const parsed = JSON.parse(stripJsonFences(s))
+    // common pattern: { "DATA": { ...actual payload... } }
+    if (parsed && typeof parsed === 'object') {
+      const anyParsed: any = parsed
+      if (anyParsed.DATA && typeof anyParsed.DATA === 'object') return anyParsed.DATA
+      if (anyParsed.data && typeof anyParsed.data === 'object') return anyParsed.data
+    }
+    return parsed
   } catch {
     // ignore
   }
@@ -167,7 +197,14 @@ function extractJsonObjectFromText(text: string): unknown {
     if (ch === '}') depth--
     if (depth === 0) {
       const candidate = src.slice(0, i + 1)
-      return JSON.parse(candidate)
+      const parsed = JSON.parse(candidate)
+      // common wrapper: { "DATA": {...} } or { "data": {...} }
+      if (parsed && typeof parsed === 'object') {
+        const anyParsed: any = parsed
+        if (anyParsed.DATA && typeof anyParsed.DATA === 'object') return anyParsed.DATA
+        if (anyParsed.data && typeof anyParsed.data === 'object') return anyParsed.data
+      }
+      return parsed
     }
   }
   throw new Error('Failed to parse JSON object from output')
@@ -276,9 +313,11 @@ async function openaiResponsesJson<T>(body: any): Promise<T> {
 
 async function openaiImagePng(prompt: string): Promise<Uint8Array> {
   const apiKey = requireEnv('OPENAI_API_KEY')
+  const imageModel = (Deno.env.get('OPENAI_IMAGE_MODEL') ?? 'gpt-image-1-mini').trim() || 'gpt-image-1-mini'
   const envSize = Deno.env.get('OPENAI_IMAGE_SIZE')?.trim()
   const sizes = Array.from(new Set([envSize, '1792x1024', '1024x1024'].filter(Boolean))) as string[]
-  const timeoutMs = Number(Deno.env.get('OPENAI_IMAGE_TIMEOUT_MS') ?? '180000') || 180000
+  // "2분 무응답이면 재시도" 요구사항: 기본 타임아웃을 120초로 둡니다(환경변수로 override 가능).
+  const timeoutMs = Number(Deno.env.get('OPENAI_IMAGE_TIMEOUT_MS') ?? '120000') || 120000
   const maxAttemptsPerSize = Math.max(1, Math.min(Number(Deno.env.get('OPENAI_IMAGE_MAX_ATTEMPTS') ?? '2') || 2, 5))
 
   let lastErr: unknown = null
@@ -296,7 +335,7 @@ async function openaiImagePng(prompt: string): Promise<Uint8Array> {
               'content-type': 'application/json',
             },
             body: JSON.stringify({
-              model: 'gpt-image-1',
+              model: imageModel,
               prompt,
               size,
             }),
@@ -353,22 +392,61 @@ async function openaiImagePng(prompt: string): Promise<Uint8Array> {
 
 async function openaiTtsMp3(input: string): Promise<Uint8Array> {
   const apiKey = requireEnv('OPENAI_API_KEY')
-  const res = await fetch('https://api.openai.com/v1/audio/speech', {
-    method: 'POST',
-    headers: {
-      authorization: `Bearer ${apiKey}`,
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: 'gpt-4o-mini-tts',
-      voice: 'alloy',
-      format: 'mp3',
-      input,
-    }),
-  })
-  if (!res.ok) throw new Error(`OpenAI TTS error (${res.status}): ${await res.text()}`)
-  const ab = await res.arrayBuffer()
-  return new Uint8Array(ab)
+  const ttsModel = Deno.env.get('OPENAI_TTS_MODEL')?.trim() || 'gpt-4o-mini-tts'
+  const ttsVoice = Deno.env.get('OPENAI_TTS_VOICE')?.trim() || 'alloy'
+  // TTS timeout: 기본 60초 (환경변수로 override 가능, 최대 180초)
+  const timeoutMs = Math.max(10000, Math.min(Number(Deno.env.get('OPENAI_TTS_TIMEOUT_MS') ?? '60000') || 60000, 180000))
+  const maxAttempts = Math.max(1, Math.min(Number(Deno.env.get('OPENAI_TTS_MAX_ATTEMPTS') ?? '2') || 2, 5))
+
+  let lastErr: unknown = null
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const res = await fetchWithTimeout(
+        'https://api.openai.com/v1/audio/speech',
+        {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${apiKey}`,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: ttsModel,
+            voice: ttsVoice,
+            format: 'mp3',
+            input,
+          }),
+        },
+        timeoutMs,
+      )
+
+      if (!res.ok) {
+        const text = await res.text()
+        lastErr = new Error(`OpenAI TTS error (${res.status}, attempt ${attempt}): ${text}`)
+        // 400 (bad request)는 재시도 불가
+        if (res.status === 400) throw lastErr
+        // 429 (rate limit) / 500+ (server error)는 재시도
+        if (res.status === 429 || res.status >= 500) {
+          await sleepMs(800 * attempt)
+          continue
+        }
+        throw lastErr
+      }
+
+      const ab = await res.arrayBuffer()
+      return new Uint8Array(ab)
+    } catch (e: any) {
+      const msg = e?.name === 'AbortError' ? `timeout after ${timeoutMs}ms` : e?.message ?? String(e)
+      lastErr = new Error(`OpenAI TTS request failed (attempt ${attempt}): ${msg}`)
+      // timeout/network -> 재시도
+      if (attempt < maxAttempts) {
+        await sleepMs(600 * attempt)
+        continue
+      }
+      throw lastErr
+    }
+  }
+
+  throw lastErr ?? new Error('OpenAI TTS error: max attempts exceeded')
 }
 
 type AutoConfigOutput = {
@@ -417,6 +495,8 @@ type PackagerOutput = {
   _runtime?: {
     started_at?: string
     logs?: Array<{ ts: string; level: 'info' | 'warn' | 'error'; msg: string; data?: unknown }>
+    autoconfig_status?: 'waiting' | 'running' | 'done'
+    packager_status?: 'waiting' | 'running' | 'done'
     image_render_requests_generated?: boolean
     image_render_requests_count?: number
     images_success?: number
@@ -521,10 +601,18 @@ function normalizeImageRenderRequests(
 async function runPipeline(jobId: string, traceId: string, payload: TrendStoryStartRequest) {
   const supabase = getSupabaseServiceClient()
   const supabaseUrl = requireEnv('SUPABASE_URL').replace(/\/$/, '')
+  const serviceRoleKey = requireEnv('SUPABASE_SERVICE_ROLE_KEY')
   const bucket = Deno.env.get('YTG_BUCKET') ?? 'ytg-assets'
 
   try {
     await supabase.from('ytg_jobs').update({ status: 'RUNNING' satisfies JobStatus, error: null }).eq('id', jobId)
+
+    // packager 객체 초기화 (상태 추적용)
+    const packager: PackagerOutput = { _runtime: {} } as PackagerOutput
+    ensureRuntime(packager)
+    packager._runtime!.autoconfig_status = 'running'
+    packager._runtime!.packager_status = 'waiting'
+    await supabase.from('ytg_jobs').update({ packager }).eq('id', jobId)
 
     // ---- 0) AutoConfig Agent ----
     const extraPrompt = payload.input_as_text?.trim() ? payload.input_as_text.trim() : null
@@ -573,6 +661,7 @@ ${extraPrompt ?? '(없음)'}
       audience: payload.audience,
     })
 
+    console.log('[ytg] autoconfig 생성 시작', { jobId })
     const autoconfig = await openaiResponsesJson<AutoConfigOutput>({
       model: 'gpt-5.2',
       input: [
@@ -580,10 +669,19 @@ ${extraPrompt ?? '(없음)'}
         { role: 'user', content: autoconfigInput },
       ],
     })
+    console.log('[ytg] autoconfig 생성 완료', { jobId, scene_count: autoconfig.scene_count })
 
-    await supabase.from('ytg_jobs').update({ autoconfig }).eq('id', jobId)
+    packager._runtime!.autoconfig_status = 'done'
+    packager._runtime!.packager_status = 'running'
+    const updAutoconfig = await supabase.from('ytg_jobs').update({ autoconfig, packager }).eq('id', jobId)
+    if (updAutoconfig.error) {
+      console.error('[ytg] autoconfig DB 업데이트 실패', { jobId, error: updAutoconfig.error.message })
+      throw new Error(`autoconfig DB 업데이트 실패: ${updAutoconfig.error.message}`)
+    }
+    console.log('[ytg] autoconfig DB 업데이트 완료', { jobId })
 
     // ---- 1) TrendStory Packager Agent ----
+    console.log('[ytg] packager 생성 시작', { jobId, scene_count: autoconfig.scene_count ?? 6 })
     const packagerInstructions = `너는 TrendStory Packager Agent다.
 
 [필수 입력]
@@ -615,8 +713,10 @@ ${extraPrompt ?? '(없음)'}
 규칙: image_render_requests = image_prompts를 scene_id별로 변환하되 size는 style_guide.platform_target이 youtube_16_9면 "1920x1080", shorts_9_16면 "1080x1920", 그 외는 "1024x1024", n=1로 고정.
 
 [출력]
-- 사람이 읽는 설명 + 마지막에 DATA(JSON) 1블록.
-- DATA에는 trend_research, story, scenes, style_guide, image_prompts, tts, video_package, youtube_meta 키를 포함.`
+- 오직 JSON만 출력한다. (설명/마크다운/코드펜스 금지)
+- 최상위 JSON에 다음 키를 반드시 포함한다:
+  trend_research, story, scenes, style_guide, image_prompts, image_render_requests, tts, video_package, youtube_meta
+- "DATA" 같은 래퍼 키로 감싸지 말 것.`
 
     const packagerInputObj = {
       topic_domain: payload.topic_domain,
@@ -635,11 +735,12 @@ ${extraPrompt ?? '(없음)'}
       input_as_text: payload.input_as_text ?? null,
     }
 
-    let packager: PackagerOutput
+    let packagerResult: PackagerOutput
     try {
       // 1차 시도: Responses API + web_search_preview tool
       // (Deno Edge에서 @openai/agents를 직접 실행하기 어려워, API 레벨로 web search를 사용)
-      packager = await openaiResponsesJson<PackagerOutput>({
+      console.log('[ytg] packager API 호출 시작 (web_search 포함)', { jobId })
+      packagerResult = await openaiResponsesJson<PackagerOutput>({
         model: 'gpt-5.2',
         input: [
           { role: 'system', content: packagerInstructions },
@@ -653,31 +754,89 @@ ${extraPrompt ?? '(없음)'}
           },
         ],
       })
-    } catch {
+      console.log('[ytg] packager API 호출 완료 (web_search 포함)', { jobId, has_scenes: Array.isArray((packagerResult as any)?.scenes) })
+    } catch (err: any) {
+      console.warn('[ytg] packager API 호출 실패 (web_search 포함), fallback 시도', { jobId, error: err?.message ?? String(err) })
       // fallback: web search 없이 생성 (모델은 gpt-5.2 유지)
-      packager = await openaiResponsesJson<PackagerOutput>({
+      packagerResult = await openaiResponsesJson<PackagerOutput>({
         model: 'gpt-5.2',
         input: [
           { role: 'system', content: packagerInstructions },
           { role: 'user', content: JSON.stringify(packagerInputObj) },
         ],
       })
+      console.log('[ytg] packager API 호출 완료 (fallback)', { jobId, has_scenes: Array.isArray((packagerResult as any)?.scenes) })
+    }
+    // packagerResult를 기존 packager 객체에 병합 (상태 유지)
+    Object.assign(packager, packagerResult)
+    if (!packager._runtime) packager._runtime = {}
+    if (!packager._runtime.logs) packager._runtime.logs = []
+
+    // ---- packager sanity check & repair ----
+    // 가끔 모델이 scenes를 누락/비우는 경우가 있어, 파이프라인이 "멈춘 것처럼" 보입니다.
+    // scenes는 이후 DB insert/TTS/이미지 생성의 핵심이므로, 최소 1회 리페어 재시도를 합니다.
+    const targetCount = Math.max(1, Math.min(Number(autoconfig.scene_count ?? 6) || 6, 12))
+    const normalizeScenes = (p: PackagerOutput) =>
+      (Array.isArray((p as any)?.scenes) ? ((p as any).scenes as any[]) : [])
+        .slice(0, targetCount)
+        .map((s, i) => ({ ...s, scene_id: Number.isFinite((s as any)?.scene_id) ? (s as any).scene_id : i + 1 }))
+        .sort((a: any, b: any) => Number(a.scene_id) - Number(b.scene_id))
+
+    let scenes = normalizeScenes(packager)
+    if (scenes.length === 0) {
+      // 디버그 힌트: 모델이 {DATA:{...}} 형태로 감싸거나 키를 빠뜨릴 수 있음
+      try {
+        const keys = packager && typeof packager === 'object' ? Object.keys(packager as any).slice(0, 40) : []
+        const anyP: any = packager as any
+        pushRuntimeLog(packager, 'warn', 'packager 루트 키 점검', {
+          keys,
+          has_DATA: Boolean(anyP?.DATA),
+          has_data: Boolean(anyP?.data),
+          data_keys: anyP?.DATA && typeof anyP.DATA === 'object' ? Object.keys(anyP.DATA).slice(0, 40) : null,
+        })
+      } catch {
+        // ignore
+      }
+      pushRuntimeLog(packager, 'warn', 'packager.scenes가 비어 있어 packager를 1회 재시도합니다.', { targetCount })
+      // "수정/리페어" 전용으로 더 강하게 요구
+      const repairInstructions = `${packagerInstructions}
+
+중요(리페어 모드):
+- 이전 출력이 불완전하여 scenes가 비어 있었습니다.
+- 반드시 scenes 배열을 최소 ${targetCount}개 포함하고, 각 scene에는 scene_id/narration/on_screen_text/visual_brief/mood/duration_sec 키를 포함한다.
+- 오직 JSON만 출력한다.`
+
+      packager = await openaiResponsesJson<PackagerOutput>({
+        model: 'gpt-5.2',
+        input: [
+          { role: 'system', content: repairInstructions },
+          { role: 'user', content: JSON.stringify(packagerInputObj) },
+        ],
+      })
+      scenes = normalizeScenes(packager)
+      if (scenes.length === 0) {
+        throw new Error('Packager output is invalid: scenes is empty (after repair attempt)')
+      }
     }
 
+    packager._runtime!.packager_status = 'done'
     pushRuntimeLog(packager, 'info', 'packager 생성 완료', {
       has_image_render_requests: Array.isArray(packager?.image_render_requests),
       image_render_requests_len: Array.isArray(packager?.image_render_requests) ? packager.image_render_requests.length : 0,
       has_image_prompts: Array.isArray(packager?.image_prompts),
       image_prompts_len: Array.isArray(packager?.image_prompts) ? packager.image_prompts.length : 0,
+      scenes_len: Array.isArray((packager as any)?.scenes) ? ((packager as any).scenes as any[]).length : 0,
     })
+    console.log('[ytg] packager 생성 완료, DB 업데이트 시작', { jobId, scenes_count: scenes.length })
 
-    await supabase.from('ytg_jobs').update({ packager }).eq('id', jobId)
+    const updPackager = await supabase.from('ytg_jobs').update({ packager }).eq('id', jobId)
+    if (updPackager.error) {
+      console.error('[ytg] packager DB 업데이트 실패', { jobId, error: updPackager.error.message })
+      throw new Error(`packager DB 업데이트 실패: ${updPackager.error.message}`)
+    }
+    console.log('[ytg] packager DB 업데이트 완료', { jobId })
 
-    const targetCount = Math.max(1, Math.min(Number(autoconfig.scene_count ?? 6) || 6, 12))
-    const scenes = (packager.scenes ?? [])
-      .slice(0, targetCount)
-      .map((s, i) => ({ ...s, scene_id: Number.isFinite(s.scene_id) ? s.scene_id : i + 1 }))
-      .sort((a, b) => a.scene_id - b.scene_id)
+    // scenes는 위에서 normalize+검증 완료된 값을 사용
 
     // 1) scenes insert (text first)
     const insScenes = await supabase.from('ytg_scenes').insert(
@@ -753,8 +912,8 @@ ${extraPrompt ?? '(없음)'}
     // NOTE: full 트랙(전체 TTS)은 생성하지 않습니다(자원 낭비 방지). 씬별만 생성합니다.
     const audioUrl: string | null = null
 
-    // 3) per-scene image generation + upload + update rows (오디오 이후)
-    const validSceneIds = new Set(scenes.map((s) => s.scene_id))
+    // 3) 이미지 생성은 "사용자 클릭 시 씬 단위로" 수행합니다.
+    //    (일괄 생성/자동 트리거 제거)
     const norm = normalizeImageRenderRequests(packager, scenes.map((s) => s.scene_id), (packager.style_guide as any)?.platform_target ?? null)
     if (norm.generated) {
       packager.image_render_requests = norm.requests
@@ -764,70 +923,13 @@ ${extraPrompt ?? '(없음)'}
       })
       await supabase.from('ytg_jobs').update({ packager }).eq('id', jobId)
     }
-
     ensureRuntime(packager).image_render_requests_count = norm.requests.length
-    let imagesSuccess = 0
-    let imagesFailed = 0
-    let imagesSkipped = 0
-    const imagesErrors: Array<{ scene_id?: number; error: string }> = []
-
-    if (norm.requests.length === 0) {
-      pushRuntimeLog(packager, 'error', 'image_render_requests가 0개라 이미지 생성을 건너뜁니다.', {
-        hint: 'packager가 image_render_requests/image_prompts를 비웠거나 scenes/scene_id 매핑이 깨졌습니다.',
-      })
-      imagesSkipped = scenes.length
-    } else {
-      for (const r of norm.requests) {
-        const sceneId = Number((r as any)?.scene_id)
-        const prompt = String((r as any)?.prompt ?? '').trim()
-        if (!Number.isFinite(sceneId) || !validSceneIds.has(sceneId) || !prompt) {
-          imagesSkipped++
-          continue
-        }
-
-        try {
-          pushRuntimeLog(packager, 'info', '이미지 생성 시작', { scene_id: sceneId })
-          const png = await openaiImagePng(prompt)
-          const path = `jobs/${jobId}/scene-${String(sceneId).padStart(2, '0')}-${safeFilename(payload.topic_domain).slice(0, 48)}.png`
-          const up = await supabase.storage.from(bucket).upload(path, new Blob([toArrayBuffer(png)], { type: 'image/png' }), {
-            contentType: 'image/png',
-            upsert: true,
-          })
-          if (up.error) throw new Error(up.error.message)
-          const publicUrl = supabase.storage.from(bucket).getPublicUrl(path).data.publicUrl
-
-          const upd = await supabase
-            .from('ytg_scenes')
-            .update({ image_path: path, image_url: publicUrl, image_prompt: prompt })
-            .eq('job_id', jobId)
-            .eq('scene_id', sceneId)
-          if (upd.error) throw new Error(upd.error.message)
-
-          await insertAssetBestEffort({
-            job_id: jobId,
-            type: 'image',
-            path,
-            url: publicUrl,
-            meta: { scene_id: sceneId, prompt, requested_size: (r as any)?.size ?? null },
-          })
-          imagesSuccess++
-          pushRuntimeLog(packager, 'info', '이미지 생성 완료', { scene_id: sceneId })
-        } catch (e: any) {
-          imagesFailed++
-          const msg = e?.message ?? String(e)
-          imagesErrors.push({ scene_id: sceneId, error: msg })
-          pushRuntimeLog(packager, 'error', '이미지 생성 실패', { scene_id: sceneId, error: msg })
-        } finally {
-          // 실행 중 진행률이 화면에 뜨도록 자주 저장
-          const rt = ensureRuntime(packager)
-          rt.images_success = imagesSuccess
-          rt.images_failed = imagesFailed
-          rt.images_skipped = imagesSkipped
-          rt.images_errors = imagesErrors
-          await supabase.from('ytg_jobs').update({ packager }).eq('id', jobId)
-        }
-      }
-    }
+    pushRuntimeLog(packager, 'info', '이미지 생성은 사용자 요청(씬 단위)로 진행됩니다.', {
+      available: norm.requests.length,
+      hint: '각 씬 이미지 영역의 "생성" 버튼을 눌러 1장씩 생성하세요.',
+    })
+    // packager의 _runtime 업데이트를 DB에 반영
+    await supabase.from('ytg_jobs').update({ packager }).eq('id', jobId)
 
     // 4) assets insert (json marker only)
     const insAssets = await supabase.from('ytg_assets').insert({
@@ -867,7 +969,7 @@ ${extraPrompt ?? '(없음)'}
 
     const updJob = await supabase
       .from('ytg_jobs')
-      .update({ status: 'SUCCEEDED' satisfies JobStatus, final_package, error: null })
+      .update({ status: 'SUCCEEDED' satisfies JobStatus, final_package, packager, error: null })
       .eq('id', jobId)
     if (updJob.error) throw new Error(updJob.error.message)
   } catch (err: any) {
@@ -898,24 +1000,61 @@ Deno.serve(async (req) => {
   // 따라서 프론트는 trendstory-status 폴링으로 결과를 받게 됩니다.
   const service = getSupabaseServiceClient()
 
-  // 1) create job (QUEUED)
-  const insertJob = await service
-    .from('ytg_jobs')
-    .insert({
-      status: 'QUEUED' satisfies JobStatus,
-      input: payload,
-      autoconfig: null,
-      packager: null,
-      final_package: null,
-      error: null,
-    })
-    .select('id, trace_id')
-    .single()
+  let jobId: string
+  let traceId: string
 
-  if (insertJob.error) return json({ error: insertJob.error.message }, 500)
+  // 기존 job 재사용 (재시작)
+  if (payload.job_id?.trim()) {
+    const existingJobId = payload.job_id.trim()
+    // 기존 job 확인
+    const existingJob = await service.from('ytg_jobs').select('id, trace_id').eq('id', existingJobId).single()
+    if (existingJob.error) {
+      return json({ error: `기존 job을 찾을 수 없습니다: ${existingJob.error.message}` }, 404)
+    }
 
-  const jobId = insertJob.data.id as string
-  const traceId = insertJob.data.trace_id as string
+    // 기존 job을 QUEUED로 리셋하고 입력값 업데이트
+    const resetJob = await service
+      .from('ytg_jobs')
+      .update({
+        status: 'QUEUED' satisfies JobStatus,
+        input: payload,
+        autoconfig: null,
+        packager: null,
+        final_package: null,
+        error: null,
+      })
+      .eq('id', existingJobId)
+      .select('id, trace_id')
+      .single()
+
+    if (resetJob.error) return json({ error: resetJob.error.message }, 500)
+
+    // 기존 scenes/assets 삭제 (깔끔한 재시작)
+    await service.from('ytg_scenes').delete().eq('job_id', existingJobId)
+    await service.from('ytg_assets').delete().eq('job_id', existingJobId)
+
+    jobId = resetJob.data.id as string
+    traceId = resetJob.data.trace_id as string
+  } else {
+    // 새 job 생성
+    const insertJob = await service
+      .from('ytg_jobs')
+      .insert({
+        status: 'QUEUED' satisfies JobStatus,
+        input: payload,
+        autoconfig: null,
+        packager: null,
+        final_package: null,
+        error: null,
+      })
+      .select('id, trace_id')
+      .single()
+
+    if (insertJob.error) return json({ error: insertJob.error.message }, 500)
+
+    jobId = insertJob.data.id as string
+    traceId = insertJob.data.trace_id as string
+  }
 
   // 2) background pipeline
   // @ts-ignore - Supabase Edge Runtime provides EdgeRuntime.waitUntil

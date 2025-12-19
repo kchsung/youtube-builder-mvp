@@ -56,6 +56,10 @@ type DbSceneRow = {
   image_prompt: string | null
   image_path: string | null
   image_url: string | null
+  image_gen_status?: string | null
+  image_gen_request_id?: string | null
+  image_gen_started_at?: string | null
+  image_gen_error?: string | null
 }
 
 type DbAssetRow = {
@@ -108,7 +112,9 @@ Deno.serve(async (req) => {
 
   const scenesRes = await supabase
     .from('ytg_scenes')
-    .select('id, job_id, scene_id, narration, on_screen_text, visual_brief, mood, duration_sec, image_prompt, image_path, image_url')
+    .select(
+      'id, job_id, scene_id, narration, on_screen_text, visual_brief, mood, duration_sec, image_prompt, image_path, image_url, image_gen_status, image_gen_request_id, image_gen_started_at, image_gen_error',
+    )
     .eq('job_id', jobId)
     .order('scene_id', { ascending: true })
 

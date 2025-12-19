@@ -3,6 +3,7 @@ export type TrendStoryStartRequest = {
   language: string
   audience: string
   input_as_text?: string
+  job_id?: string // 기존 job 재사용 시 (재시작)
 }
 
 export type TrendStoryStartResponse = {
@@ -35,6 +36,10 @@ export type DbSceneRow = {
   image_prompt: string | null
   image_path: string | null
   image_url: string | null
+  image_gen_status?: string | null
+  image_gen_request_id?: string | null
+  image_gen_started_at?: string | null
+  image_gen_error?: string | null
 }
 
 export type DbAssetRow = {
@@ -83,9 +88,25 @@ export type TrendStoryRetryImagesResponse = {
   message?: string
 }
 
+export type TrendStoryGenerateSceneImageRequest = {
+  job_id: string
+  scene_id: number
+  force?: boolean
+}
+
+export type TrendStoryGenerateSceneImageResponse = {
+  job_id: string
+  scene_id: number
+  accepted: boolean
+  status: 'QUEUED' | 'ALREADY_EXISTS' | 'IN_PROGRESS' | 'SUCCEEDED' | 'FAILED'
+  image_url?: string | null
+  message?: string
+}
+
 export type TrendStoryRetryAudioRequest = {
   job_id: string
   force?: boolean
+  scene_ids?: number[] // 선택된 씬만 재생성 (없으면 전체)
 }
 
 export type TrendStoryRetryAudioResponse = {

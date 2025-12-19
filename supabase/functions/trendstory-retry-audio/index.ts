@@ -72,6 +72,7 @@ async function openaiTtsMp3(input: string): Promise<Uint8Array> {
 type RetryAudioRequest = {
   job_id: string
   force?: boolean
+  scene_ids?: number[] // 선택된 씬만 재생성 (없으면 전체)
 }
 
 type RetryAudioResponse = {
@@ -80,18 +81,18 @@ type RetryAudioResponse = {
   message: string
 }
 
-async function runRetryAudio(jobId: string) {
+async function runRetryAudio(jobId: string, sceneIds?: number[]) {
   const supabase = getSupabaseServiceClient()
   const bucket = Deno.env.get('YTG_BUCKET') ?? 'ytg-assets'
 
   const jobRes = await supabase.from('ytg_jobs').select('id, packager, final_package').eq('id', jobId).single()
   if (jobRes.error) throw new Error(jobRes.error.message)
 
-  const scenesRes = await supabase
-    .from('ytg_scenes')
-    .select('scene_id, narration')
-    .eq('job_id', jobId)
-    .order('scene_id', { ascending: true })
+  let scenesQuery = supabase.from('ytg_scenes').select('scene_id, narration').eq('job_id', jobId)
+  if (sceneIds && sceneIds.length > 0) {
+    scenesQuery = scenesQuery.in('scene_id', sceneIds)
+  }
+  const scenesRes = await scenesQuery.order('scene_id', { ascending: true })
   if (scenesRes.error) throw new Error(scenesRes.error.message)
 
   const packager = jobRes.data.packager ?? null
@@ -170,12 +171,14 @@ Deno.serve(async (req) => {
   const jobId = String(payload?.job_id ?? '').trim()
   if (!jobId) return json({ error: 'job_id is required' }, 400)
 
+  const sceneIds = Array.isArray(payload.scene_ids) ? payload.scene_ids.map((n) => Number(n)).filter((n) => Number.isFinite(n)) : undefined
+
   // 즉시 응답 후 백그라운드 실행 (CORS/timeout 방지)
   const waitUntil = (globalThis as any).EdgeRuntime?.waitUntil
   if (typeof waitUntil === 'function') {
-    waitUntil(runRetryAudio(jobId))
+    waitUntil(runRetryAudio(jobId, sceneIds))
   } else {
-    runRetryAudio(jobId)
+    runRetryAudio(jobId, sceneIds)
   }
 
   const out: RetryAudioResponse = {

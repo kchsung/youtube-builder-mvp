@@ -25,6 +25,32 @@ function requireEnv(name: string) {
   return v
 }
 
+function pickJwtKey(keys: Array<string | null | undefined>) {
+  for (const k of keys) {
+    const t = (k ?? '').trim()
+    if (!t) continue
+    if (t.split('.').length >= 3) return t
+  }
+  // fallback: return first non-empty (even if misconfigured) for logging
+  for (const k of keys) {
+    const t = (k ?? '').trim()
+    if (t) return t
+  }
+  return ''
+}
+
+function buildEdgeFunctionAuthHeaders(key: string) {
+  const t = (key ?? '').trim()
+  if (!t) return { ok: false, headers: { 'content-type': 'application/json' } as Record<string, string>, jwtLike: false }
+  const jwtLike = t.split('.').length >= 3
+  // NOTE:
+  // - verify_jwt=true(기본)인 함수는 Authorization: Bearer <JWT>가 필요합니다.
+  // - 새 키 체계(sbp_/sbs_ 등)처럼 JWT가 아닌 키를 쓰는 경우 verify_jwt=false로 배포해야 합니다.
+  const headers: Record<string, string> = { apikey: t, 'content-type': 'application/json' }
+  if (jwtLike) headers.Authorization = `Bearer ${t}`
+  return { ok: true, headers, jwtLike }
+}
+
 function getSupabaseServiceClient() {
   const url = requireEnv('SUPABASE_URL')
   const serviceRoleKey = requireEnv('SUPABASE_SERVICE_ROLE_KEY')
@@ -51,9 +77,11 @@ function sleepMs(ms: number) {
 
 async function openaiImagePng(prompt: string): Promise<Uint8Array> {
   const apiKey = requireEnv('OPENAI_API_KEY')
+  const imageModel = (Deno.env.get('OPENAI_IMAGE_MODEL') ?? 'gpt-image-1-mini').trim() || 'gpt-image-1-mini'
   const envSize = Deno.env.get('OPENAI_IMAGE_SIZE')?.trim()
   const sizes = Array.from(new Set([envSize, '1792x1024', '1024x1024'].filter(Boolean))) as string[]
-  const timeoutMs = Number(Deno.env.get('OPENAI_IMAGE_TIMEOUT_MS') ?? '180000') || 180000
+  // "2분 무응답이면 재시도" 요구사항: 기본 타임아웃을 120초로 둡니다(환경변수로 override 가능).
+  const timeoutMs = Number(Deno.env.get('OPENAI_IMAGE_TIMEOUT_MS') ?? '120000') || 120000
   const maxAttemptsPerSize = Math.max(1, Math.min(Number(Deno.env.get('OPENAI_IMAGE_MAX_ATTEMPTS') ?? '2') || 2, 5))
 
   let lastErr: unknown = null
@@ -67,7 +95,7 @@ async function openaiImagePng(prompt: string): Promise<Uint8Array> {
           {
             method: 'POST',
             headers: { authorization: `Bearer ${apiKey}`, 'content-type': 'application/json' },
-            body: JSON.stringify({ model: 'gpt-image-1', prompt, size }),
+            body: JSON.stringify({ model: imageModel, prompt, size }),
           },
           timeoutMs,
         )
@@ -141,6 +169,8 @@ type RetryImagesRequest = {
   job_id: string
   scene_ids?: number[]
   missing_only?: boolean
+  // 내부 self-requeue 용 (프론트에서 보낼 필요 없음)
+  depth?: number
 }
 
 type RetryImagesResponse = {
@@ -160,18 +190,37 @@ async function runRetryInBackground(args: {
   style: any
   packager: any
   tasks: Array<{ scene_id: number; prompt: string }>
+  depth: number
 }) {
-  const { jobId, bucket, topic, style, packager, tasks } = args
+  const { jobId, bucket, topic, style, packager, tasks, depth } = args
   const supabase = getSupabaseServiceClient()
 
   pushRuntimeLog(packager, 'info', '이미지 재시도 백그라운드 작업 시작', { job_id: jobId, tasks: tasks.length })
+
+  const startedAt = Date.now()
+  const maxRuntimeMs = Math.max(5000, Math.min(Number(Deno.env.get('RETRY_IMAGES_MAX_RUNTIME_MS') ?? '50000') || 50000, 110000))
+  const maxDepth = Math.max(0, Math.min(Number(Deno.env.get('RETRY_IMAGES_MAX_DEPTH') ?? '10') || 10, 30))
 
   let attempted = 0
   let succeeded = 0
   let failed = 0
   let skipped = 0
 
-  for (const t of tasks) {
+  let remainingSceneIds: number[] = []
+
+  for (let idx = 0; idx < tasks.length; idx++) {
+    if (Date.now() - startedAt > maxRuntimeMs) {
+      remainingSceneIds = tasks.slice(idx).map((x) => Number(x.scene_id)).filter((n) => Number.isFinite(n))
+      pushRuntimeLog(packager, 'warn', '실행 시간 예산 초과로 다음 배치로 넘깁니다.', {
+        job_id: jobId,
+        depth,
+        maxRuntimeMs,
+        remaining: remainingSceneIds.length,
+      })
+      break
+    }
+
+    const t = tasks[idx]
     const sceneId = Number(t.scene_id)
     const prompt = String(t.prompt ?? '').trim()
     if (!Number.isFinite(sceneId) || !prompt) {
@@ -227,6 +276,58 @@ async function runRetryInBackground(args: {
 
   pushRuntimeLog(packager, 'info', '이미지 재시도 백그라운드 작업 종료', { attempted, succeeded, failed, skipped })
   await supabase.from('ytg_jobs').update({ packager }).eq('id', jobId)
+
+  // 남은 작업이 있으면 self-requeue (Edge Function 실행 제한/중단 대비)
+  if (remainingSceneIds.length > 0 && depth < maxDepth) {
+    const supabaseUrl = requireEnv('SUPABASE_URL').replace(/\/$/, '')
+    const serviceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')
+    const anonKey = Deno.env.get('SUPABASE_ANON_KEY')
+    const authKey = pickJwtKey([serviceRoleKey, anonKey])
+    const endpoint = `${supabaseUrl}/functions/v1/trendstory-retry-images`
+    const body: RetryImagesRequest = {
+      job_id: jobId,
+      scene_ids: remainingSceneIds,
+      missing_only: true,
+      depth: depth + 1,
+    }
+
+    const waitUntil = (globalThis as any).EdgeRuntime?.waitUntil
+    pushRuntimeLog(packager, 'info', '이미지 재시도 다음 배치 요청(인증 정보 점검)', {
+      depth,
+      next_depth: depth + 1,
+      auth_segments: authKey.split('.').length,
+      auth_len: authKey.length,
+    })
+
+    const auth = buildEdgeFunctionAuthHeaders(authKey)
+    if (!auth.ok) {
+      pushRuntimeLog(packager, 'error', 'self-requeue 인증키가 비어있습니다. Supabase Secrets를 확인하세요.', {
+        hint: 'SUPABASE_SERVICE_ROLE_KEY 또는 SUPABASE_ANON_KEY가 필요합니다.',
+      })
+      return
+    }
+    if (!auth.jwtLike) {
+      pushRuntimeLog(packager, 'warn', 'self-requeue 인증키가 JWT가 아닙니다. 이 경우 함수 verify_jwt=false가 필요합니다.', {
+        hint: 'Supabase Dashboard → Edge Functions → trendstory-retry-images → JWT Verification(verify_jwt) 끄기',
+      })
+    }
+
+    const kick = fetch(endpoint, {
+      method: 'POST',
+      headers: auth.headers,
+      body: JSON.stringify(body),
+    })
+      .then(async (r) => {
+        const t = await r.text().catch(() => '')
+        pushRuntimeLog(packager, 'info', '이미지 재시도 다음 배치 요청 완료', { status: r.status, body: t.slice(0, 200) })
+      })
+      .catch((e: any) => {
+        pushRuntimeLog(packager, 'error', '이미지 재시도 다음 배치 요청 실패', { error: e?.message ?? String(e) })
+      })
+
+    if (typeof waitUntil === 'function') waitUntil(kick)
+    else await kick
+  }
 }
 
 Deno.serve(async (req) => {
@@ -244,6 +345,8 @@ Deno.serve(async (req) => {
 
   const jobId = String(payload?.job_id ?? '').trim()
   if (!jobId) return json({ error: 'job_id is required' }, 400)
+
+  const depth = Number((payload as any)?.depth ?? 0) || 0
 
   const supabase = getSupabaseServiceClient()
   const bucket = Deno.env.get('YTG_BUCKET') ?? 'ytg-assets'
@@ -322,10 +425,10 @@ Deno.serve(async (req) => {
   // 즉시 응답 후 백그라운드에서 실행 (브라우저 CORS/504 방지)
   const waitUntil = (globalThis as any).EdgeRuntime?.waitUntil
   if (typeof waitUntil === 'function') {
-    waitUntil(runRetryInBackground({ jobId, bucket, topic, style, packager, tasks }))
+    waitUntil(runRetryInBackground({ jobId, bucket, topic, style, packager, tasks, depth }))
   } else {
     // fallback: inline (개발 환경)
-    runRetryInBackground({ jobId, bucket, topic, style, packager, tasks })
+    runRetryInBackground({ jobId, bucket, topic, style, packager, tasks, depth })
   }
 
   // best-effort: store initial logs + queue info
