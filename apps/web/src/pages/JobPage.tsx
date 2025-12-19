@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { Link, useParams } from 'react-router-dom'
 import { ApiError, functionsGet, functionsPost } from '../lib/functionsClient'
 import { copyText, downloadFileFromUrl, downloadJson, downloadScenesImagesZip } from '../lib/clientUtils'
 import type {
@@ -24,7 +24,6 @@ function formatStatus(status: string) {
 export function JobPage() {
   const { id } = useParams()
   const jobId = id ?? ''
-  const nav = useNavigate()
   const [data, setData] = useState<TrendStoryStatusResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(true)
